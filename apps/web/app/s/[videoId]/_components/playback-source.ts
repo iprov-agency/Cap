@@ -64,16 +64,9 @@ async function probePlaybackSource(
 }
 
 export function detectCrossOriginSupport(url: string): boolean {
-	try {
-		const hostname = new URL(url, "https://cap.so").hostname;
-		const isR2OrS3 =
-			hostname.includes("r2.cloudflarestorage.com") ||
-			hostname.includes("s3.amazonaws.com") ||
-			hostname.includes(".s3.");
-		return !isR2OrS3;
-	} catch {
-		return true;
-	}
+	// Self-hosted: CORS is configured on the R2 bucket, so all URLs support crossOrigin.
+	// The upstream check assumes S3/R2 URLs never have CORS, which is wrong for self-hosted.
+	return true;
 }
 
 export function canPlayRawContentType(
