@@ -518,13 +518,14 @@ export function CapVideoPlayer({
 		videoSrc,
 	]);
 
+	const isAutoRetrying = hasError && autoRetryCount < 5;
 	const showPreparingOverlay =
 		!videoLoaded &&
 		!uploadProgress &&
-		!hasError &&
+		(!hasError || isAutoRetrying) &&
 		(!resolvedSrc.isSuccess || Boolean(resolvedSrc.data));
 	const showPlaybackResolutionError =
-		hasError && !uploadProgress && !resolvedSrc.data && !resolvedSrc.isPending;
+		hasError && !isAutoRetrying && !uploadProgress && !resolvedSrc.data && !resolvedSrc.isPending;
 	const showRawPlaybackBadge =
 		showPlaybackStatusBadge && resolvedSrc.data?.type === "raw";
 	const rawPlaybackBadgeLabel =
