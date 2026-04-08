@@ -45,7 +45,6 @@ interface AiResult {
 const MAX_CHARS_PER_CHUNK = 24000;
 
 export async function generateAiWorkflow(payload: GenerateAiWorkflowPayload) {
-	"use workflow";
 
 	const { videoId, userId } = payload;
 
@@ -69,7 +68,6 @@ export async function generateAiWorkflow(payload: GenerateAiWorkflowPayload) {
 }
 
 async function validateAndSetProcessing(videoId: string): Promise<VideoData> {
-	"use step";
 
 	const gemini = getGeminiClient();
 	if (!gemini) {
@@ -119,7 +117,6 @@ async function fetchTranscript(
 	userId: string,
 	bucketId: S3Bucket.S3BucketId | null,
 ): Promise<TranscriptData | null> {
-	"use step";
 
 	const vtt = await Effect.gen(function* () {
 		const [bucket] = yield* S3Buckets.getBucketAccess(
@@ -149,7 +146,6 @@ async function markSkipped(
 	videoId: string,
 	metadata: VideoMetadata,
 ): Promise<void> {
-	"use step";
 
 	await db()
 		.update(videos)
@@ -163,7 +159,6 @@ async function markSkipped(
 }
 
 async function generateWithAi(transcript: TranscriptData): Promise<AiResult> {
-	"use step";
 
 	const chunks = chunkTranscriptWithTimestamps(transcript.segments);
 
@@ -179,7 +174,6 @@ async function saveResults(
 	videoData: VideoData,
 	result: AiResult,
 ): Promise<void> {
-	"use step";
 
 	const { video, metadata } = videoData;
 

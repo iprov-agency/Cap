@@ -39,7 +39,6 @@ function getValidDuration(duration: number) {
 export async function processVideoWorkflow(
 	payload: ProcessVideoWorkflowPayload,
 ): Promise<VideoProcessingResult> {
-	"use workflow";
 
 	const { videoId, userId, rawFileKey, bucketId } = payload;
 
@@ -72,7 +71,6 @@ async function validateProcessingRequest(
 	videoId: string,
 	rawFileKey: string,
 ): Promise<void> {
-	"use step";
 
 	const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
 	if (!mediaServerUrl) {
@@ -220,7 +218,6 @@ async function processVideoOnMediaServer(
 	rawFileKey: string,
 	bucketId: string | null,
 ): Promise<MediaServerProcessResult> {
-	"use step";
 
 	const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
 	const webhookBaseUrl =
@@ -331,7 +328,6 @@ async function saveMetadataAndComplete(
 	videoId: string,
 	metadata: { duration: number; width: number; height: number; fps: number },
 ): Promise<void> {
-	"use step";
 
 	const duration = getValidDuration(metadata.duration);
 
@@ -354,7 +350,6 @@ async function cleanupRawUpload(
 	rawFileKey: string,
 	bucketId: string | null,
 ): Promise<void> {
-	"use step";
 
 	try {
 		const [bucket] = await S3Buckets.getBucketAccess(
@@ -371,7 +366,6 @@ async function setProcessingError(
 	videoId: string,
 	errorMessage: string,
 ): Promise<void> {
-	"use step";
 
 	await db()
 		.update(videoUploads)

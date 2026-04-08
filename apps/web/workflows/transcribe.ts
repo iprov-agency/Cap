@@ -57,7 +57,6 @@ interface VideoData {
 export async function transcribeVideoWorkflow(
 	payload: TranscribeWorkflowPayload,
 ) {
-	"use workflow";
 
 	const { videoId, userId, aiGenerationEnabled } = payload;
 
@@ -108,7 +107,6 @@ export async function transcribeVideoWorkflow(
 }
 
 async function validateVideo(videoId: string): Promise<VideoData> {
-	"use step";
 
 	if (!serverEnv().GOOGLE_API_KEY) {
 		throw new FatalError("Missing GOOGLE_API_KEY for Gemini transcription");
@@ -162,7 +160,6 @@ async function validateVideo(videoId: string): Promise<VideoData> {
 }
 
 async function markSkipped(videoId: string): Promise<void> {
-	"use step";
 
 	await db()
 		.update(videos)
@@ -171,7 +168,6 @@ async function markSkipped(videoId: string): Promise<void> {
 }
 
 async function markNoAudio(videoId: string): Promise<void> {
-	"use step";
 
 	await db()
 		.update(videos)
@@ -184,7 +180,6 @@ async function extractAudio(
 	userId: string,
 	bucketId: S3Bucket.S3BucketId | null,
 ): Promise<string | null> {
-	"use step";
 
 	const [bucket] = await S3Buckets.getBucketAccess(
 		Option.fromNullable(bucketId),
@@ -303,7 +298,6 @@ async function resolveVideoSourceUrl(
 }
 
 async function transcribeWithGemini(audioUrl: string): Promise<string> {
-	"use step";
 
 	const gemini = getGeminiClient();
 	if (!gemini) {
@@ -355,7 +349,6 @@ async function saveTranscription(
 	bucketId: S3Bucket.S3BucketId | null,
 	transcription: string,
 ): Promise<void> {
-	"use step";
 
 	const [bucket] = await S3Buckets.getBucketAccess(
 		Option.fromNullable(bucketId),
@@ -378,7 +371,6 @@ async function cleanupTempAudio(
 	userId: string,
 	bucketId: S3Bucket.S3BucketId | null,
 ): Promise<void> {
-	"use step";
 
 	const audioKey = `${userId}/${videoId}/audio-temp.mp3`;
 
@@ -400,13 +392,11 @@ async function queueAiGeneration(
 	videoId: string,
 	userId: string,
 ): Promise<void> {
-	"use step";
 
 	await startAiGeneration(videoId as Video.VideoId, userId);
 }
 
 async function _markEnhancedAudioProcessing(videoId: string): Promise<void> {
-	"use step";
 
 	const [video] = await db()
 		.select({ metadata: videos.metadata })
@@ -432,7 +422,6 @@ async function _enhanceAndSaveAudio(
 	audioUrl: string,
 	bucketId: S3Bucket.S3BucketId | null,
 ): Promise<void> {
-	"use step";
 
 	console.log(`[transcribe] Starting audio enhancement for video ${videoId}`);
 

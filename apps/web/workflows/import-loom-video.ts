@@ -134,7 +134,6 @@ interface LoomProcessingInput {
 export async function importLoomVideoWorkflow(
 	payload: ImportLoomPayload,
 ): Promise<VideoProcessingResult> {
-	"use workflow";
 
 	const processingInput = await downloadLoomToS3(payload);
 
@@ -170,7 +169,6 @@ function getInputExtension(url: string): string | undefined {
 async function downloadLoomToS3(
 	payload: ImportLoomPayload,
 ): Promise<LoomProcessingInput> {
-	"use step";
 
 	const { videoId, loomVideoId, rawFileKey, bucketId } = payload;
 
@@ -320,7 +318,6 @@ async function processVideoOnMediaServer(
 	payload: ImportLoomPayload,
 	processingInput: LoomProcessingInput,
 ): Promise<MediaServerProcessResult> {
-	"use step";
 
 	const { videoId, userId, rawFileKey, bucketId } = payload;
 
@@ -431,7 +428,6 @@ async function saveMetadataAndComplete(
 	videoId: string,
 	metadata: { duration: number; width: number; height: number; fps: number },
 ): Promise<void> {
-	"use step";
 
 	await db()
 		.update(videos)
