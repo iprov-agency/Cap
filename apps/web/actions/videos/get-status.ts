@@ -58,20 +58,38 @@ export async function getVideoStatus(
 
 	if (!video.transcriptionStatus && serverEnv().GOOGLE_API_KEY) {
 		const activeUpload = await db()
-			.select({ videoId: videoUploads.videoId })
+			.select({
+				videoId: videoUploads.videoId,
+				phase: videoUploads.phase,
+				updatedAt: videoUploads.updatedAt,
+			})
 			.from(videoUploads)
 			.where(eq(videoUploads.videoId, videoId))
 			.limit(1);
 
 		if (activeUpload.length > 0) {
-			return {
-				transcriptionStatus: null,
-				aiGenerationStatus:
-					(metadata.aiGenerationStatus as AiGenerationStatus) || null,
-				aiTitle: metadata.aiTitle || null,
-				summary: metadata.summary || null,
-				chapters: metadata.chapters || null,
-			};
+			const upload = activeUpload[0]!;
+			const ageMs = Date.now() - new Date(upload.updatedAt).getTime();
+			const isStale = ageMs > 5 * 60 * 1000;
+
+			if (isStale && upload.phase === "uploading") {
+				// Upload is stuck. Clean it up so transcription can proceed.
+				console.log(
+					`[Get Status] Cleaning up stale upload record for video ${videoId} (phase: ${upload.phase}, age: ${Math.round(ageMs / 1000)}s)`,
+				);
+				await db()
+					.delete(videoUploads)
+					.where(eq(videoUploads.videoId, videoId));
+			} else {
+				return {
+					transcriptionStatus: null,
+					aiGenerationStatus:
+						(metadata.aiGenerationStatus as AiGenerationStatus) || null,
+					aiTitle: metadata.aiTitle || null,
+					summary: metadata.summary || null,
+					chapters: metadata.chapters || null,
+				};
+			}
 		}
 
 		console.log(
