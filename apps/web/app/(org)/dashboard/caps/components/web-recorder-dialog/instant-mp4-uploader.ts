@@ -343,11 +343,34 @@ export class InstantRecordingUploader {
 		if (this.bufferedBytes === 0) return;
 		if (!force && this.bufferedBytes < MIN_PART_SIZE_BYTES) return;
 
-		const chunk = new Blob(this.bufferedChunks, { type: this.mimeType });
+		const combined = new Blob(this.bufferedChunks, { type: this.mimeType });
 		this.bufferedChunks = [];
 		this.bufferedBytes = 0;
 
-		this.enqueueUpload(chunk);
+		if (force) {
+			// Final flush: send whatever remains as the last part
+			this.enqueueUpload(combined);
+			return;
+		}
+
+		// R2 requires all non-trailing parts to be the same size.
+		// Slice exactly MIN_PART_SIZE_BYTES per part, keep remainder buffered.
+		let offset = 0;
+		while (offset + MIN_PART_SIZE_BYTES <= combined.size) {
+			const part = combined.slice(
+				offset,
+				offset + MIN_PART_SIZE_BYTES,
+				this.mimeType,
+			);
+			this.enqueueUpload(part);
+			offset += MIN_PART_SIZE_BYTES;
+		}
+
+		if (offset < combined.size) {
+			const remainder = combined.slice(offset, combined.size, this.mimeType);
+			this.bufferedChunks.push(remainder);
+			this.bufferedBytes = remainder.size;
+		}
 	}
 
 	private createFinalBlobPart(finalBlob: Blob, start: number, end: number) {
