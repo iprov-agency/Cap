@@ -1,3 +1,5 @@
+export const dynamic = "force-dynamic";
+
 import { db } from "@cap/database";
 import { getCurrentUser } from "@cap/database/auth/session";
 import {
