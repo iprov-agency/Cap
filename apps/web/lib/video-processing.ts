@@ -2,7 +2,6 @@ import { db } from "@cap/database";
 import { videoUploads } from "@cap/database/schema";
 import type { S3Bucket, Video } from "@cap/web-domain";
 import { and, eq, ne } from "drizzle-orm";
-import { start } from "workflow/api";
 import { processVideoWorkflow } from "@/workflows/process-video";
 
 export type VideoProcessingStartStatus = "started" | "already-processing";
@@ -119,14 +118,13 @@ export async function startVideoProcessingWorkflow({
 	}
 
 	try {
-		await start(processVideoWorkflow, [
-			{
-				videoId,
-				userId,
-				rawFileKey,
-				bucketId: bucketId as S3Bucket.S3BucketId | null,
-			},
-		]);
+		// Call workflow directly (bypass workflow RPC engine, not available in self-hosted)
+		await processVideoWorkflow({
+			videoId,
+			userId,
+			rawFileKey,
+			bucketId: bucketId as S3Bucket.S3BucketId | null,
+		});
 		return "started";
 	} catch (error) {
 		const normalizedError =

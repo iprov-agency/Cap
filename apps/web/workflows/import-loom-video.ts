@@ -6,7 +6,13 @@ import { S3Buckets } from "@cap/web-backend";
 import { S3Bucket, type Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
-import { FatalError } from "workflow";
+// FatalError from workflow package not available without workflow runtime
+class FatalError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "FatalError";
+	}
+}
 import { runPromise } from "@/lib/server";
 
 interface ImportLoomPayload {

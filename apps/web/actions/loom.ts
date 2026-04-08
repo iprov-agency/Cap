@@ -16,7 +16,6 @@ import type { Organisation } from "@cap/web-domain";
 import { Video } from "@cap/web-domain";
 import { and, eq } from "drizzle-orm";
 import { revalidatePath } from "next/cache";
-import { start } from "workflow/api";
 import { importLoomVideoWorkflow } from "@/workflows/import-loom-video";
 
 interface LoomUrlResponse {
@@ -348,16 +347,17 @@ export async function importFromLoom({
 			.catch(() => {});
 	}
 
-	await start(importLoomVideoWorkflow, [
-		{
-			videoId,
-			userId: user.id,
-			rawFileKey,
-			bucketId: customBucket?.id ?? null,
-			loomDownloadUrl: downloadUrl,
-			loomVideoId,
-		},
-	]);
+	// Call workflow directly (bypass workflow RPC engine, not available in self-hosted)
+	importLoomVideoWorkflow({
+		videoId,
+		userId: user.id,
+		rawFileKey,
+		bucketId: customBucket?.id ?? null,
+		loomDownloadUrl: downloadUrl,
+		loomVideoId,
+	}).catch((err) => {
+		console.error(`[loom] Import workflow failed for ${videoId}:`, err);
+	});
 
 	revalidatePath("/dashboard/caps");
 
