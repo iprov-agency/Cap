@@ -12,7 +12,6 @@ import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import { S3Buckets } from "@cap/web-backend";
 import type { S3Bucket, Video } from "@cap/web-domain";
-import { createClient } from "@deepgram/sdk";
 import { eq } from "drizzle-orm";
 import { Option } from "effect";
 import { FatalError } from "workflow";
@@ -24,13 +23,17 @@ import {
 import { checkHasAudioTrack, extractAudioFromUrl } from "@/lib/audio-extract";
 import { startAiGeneration } from "@/lib/generate-ai";
 import {
+	GEMINI_AUDIO_MODEL,
+	getGeminiClient,
+} from "@/lib/gemini-client";
+import {
 	checkHasAudioTrackViaMediaServer,
 	extractAudioViaMediaServer,
 	isMediaServerConfigured,
 	probeVideoViaMediaServer,
 } from "@/lib/media-client";
 import { runPromise } from "@/lib/server";
-import { type DeepgramResult, formatToWebVTT } from "@/lib/transcribe-utils";
+import { geminiTextToWebVTT } from "@/lib/transcribe-utils";
 
 interface TranscribeWorkflowPayload {
 	videoId: string;
@@ -81,7 +84,7 @@ export async function transcribeVideoWorkflow(
 	// }
 
 	const [transcription] = await Promise.all([
-		transcribeWithDeepgram(audioUrl),
+		transcribeWithGemini(audioUrl),
 		// shouldEnhanceAudio
 		// 	? enhanceAndSaveAudio(videoId, userId, audioUrl, videoData.bucketId)
 		// 	: Promise.resolve(),
@@ -101,8 +104,8 @@ export async function transcribeVideoWorkflow(
 async function validateVideo(videoId: string): Promise<VideoData> {
 	"use step";
 
-	if (!serverEnv().DEEPGRAM_API_KEY) {
-		throw new FatalError("Missing DEEPGRAM_API_KEY");
+	if (!serverEnv().GOOGLE_API_KEY) {
+		throw new FatalError("Missing GOOGLE_API_KEY for Gemini transcription");
 	}
 
 	const query = await db()
@@ -293,8 +296,13 @@ async function resolveVideoSourceUrl(
 	throw new Error("Video file not accessible");
 }
 
-async function transcribeWithDeepgram(audioUrl: string): Promise<string> {
+async function transcribeWithGemini(audioUrl: string): Promise<string> {
 	"use step";
+
+	const gemini = getGeminiClient();
+	if (!gemini) {
+		throw new Error("Gemini client not configured");
+	}
 
 	const audioResponse = await fetch(audioUrl);
 	if (!audioResponse.ok) {
@@ -304,25 +312,35 @@ async function transcribeWithDeepgram(audioUrl: string): Promise<string> {
 	}
 
 	const audioBuffer = Buffer.from(await audioResponse.arrayBuffer());
+	const audioBase64 = audioBuffer.toString("base64");
 
-	const deepgram = createClient(serverEnv().DEEPGRAM_API_KEY as string);
+	const model = gemini.getGenerativeModel({ model: GEMINI_AUDIO_MODEL });
 
-	const { result, error } = await deepgram.listen.prerecorded.transcribeFile(
-		audioBuffer,
+	const result = await model.generateContent([
 		{
-			model: "nova-3",
-			smart_format: true,
-			detect_language: true,
-			utterances: true,
-			mime_type: "audio/mpeg",
+			inlineData: {
+				mimeType: "audio/mpeg",
+				data: audioBase64,
+			},
 		},
-	);
+		{
+			text: `Transcribe this audio accurately. Include timestamps for each segment.
+Format each line as: [MM:SS] transcribed text
+For example:
+[0:00] Hello and welcome to this video.
+[0:05] Today we're going to talk about...
 
-	if (error) {
-		throw new Error(`Deepgram transcription failed: ${error.message}`);
+Be precise with the timestamps and transcribe every word spoken. If there are multiple speakers, note speaker changes.`,
+		},
+	]);
+
+	const transcriptionText = result.response.text();
+
+	if (!transcriptionText || transcriptionText.trim().length === 0) {
+		throw new Error("Gemini returned empty transcription");
 	}
 
-	return formatToWebVTT(result as unknown as DeepgramResult);
+	return geminiTextToWebVTT(transcriptionText);
 }
 
 async function saveTranscription(

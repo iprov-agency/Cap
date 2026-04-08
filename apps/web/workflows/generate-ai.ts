@@ -1,13 +1,12 @@
 import { db } from "@cap/database";
 import { s3Buckets, videos } from "@cap/database/schema";
 import type { VideoMetadata } from "@cap/database/types";
-import { serverEnv } from "@cap/env";
 import { S3Buckets } from "@cap/web-backend";
 import type { S3Bucket, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
 import { FatalError } from "workflow";
-import { GROQ_MODEL, getGroqClient } from "@/lib/groq-client";
+import { GEMINI_TEXT_MODEL, getGeminiClient } from "@/lib/gemini-client";
 import { runPromise } from "@/lib/server";
 
 interface GenerateAiWorkflowPayload {
@@ -66,9 +65,9 @@ export async function generateAiWorkflow(payload: GenerateAiWorkflowPayload) {
 async function validateAndSetProcessing(videoId: string): Promise<VideoData> {
 	"use step";
 
-	const groqClient = getGroqClient();
-	if (!groqClient && !serverEnv().OPENAI_API_KEY) {
-		throw new FatalError("Missing Groq or OpenAI API key");
+	const gemini = getGeminiClient();
+	if (!gemini) {
+		throw new FatalError("Missing GOOGLE_API_KEY for Gemini");
 	}
 
 	const query = await db()
@@ -160,14 +159,13 @@ async function markSkipped(
 async function generateWithAi(transcript: TranscriptData): Promise<AiResult> {
 	"use step";
 
-	const groqClient = getGroqClient();
 	const chunks = chunkTranscriptWithTimestamps(transcript.segments);
 
 	if (chunks.length === 1) {
-		return generateSingleChunk(transcript.text, groqClient);
+		return generateSingleChunk(transcript.text);
 	}
 
-	return generateMultipleChunks(chunks, groqClient);
+	return generateMultipleChunks(chunks);
 }
 
 async function saveResults(
@@ -270,47 +268,15 @@ function chunkTranscriptWithTimestamps(
 	return chunks;
 }
 
-async function callAiApi(
-	prompt: string,
-	groqClient: ReturnType<typeof getGroqClient>,
-): Promise<string> {
-	if (groqClient) {
-		try {
-			const completion = await groqClient.chat.completions.create({
-				messages: [{ role: "user", content: prompt }],
-				model: GROQ_MODEL,
-			});
-			return completion.choices?.[0]?.message?.content || "{}";
-		} catch (groqError) {
-			if (serverEnv().OPENAI_API_KEY) {
-				return callOpenAi(prompt);
-			}
-			throw groqError;
-		}
-	} else if (serverEnv().OPENAI_API_KEY) {
-		return callOpenAi(prompt);
+async function callGemini(prompt: string): Promise<string> {
+	const gemini = getGeminiClient();
+	if (!gemini) {
+		return "{}";
 	}
-	return "{}";
-}
 
-async function callOpenAi(prompt: string): Promise<string> {
-	const aiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-		method: "POST",
-		headers: {
-			"Content-Type": "application/json",
-			Authorization: `Bearer ${serverEnv().OPENAI_API_KEY}`,
-		},
-		body: JSON.stringify({
-			model: "gpt-4o-mini",
-			messages: [{ role: "user", content: prompt }],
-		}),
-	});
-	if (!aiRes.ok) {
-		const errorText = await aiRes.text();
-		throw new Error(`OpenAI API error: ${aiRes.status} ${errorText}`);
-	}
-	const aiJson = await aiRes.json();
-	return aiJson.choices?.[0]?.message?.content || "{}";
+	const model = gemini.getGenerativeModel({ model: GEMINI_TEXT_MODEL });
+	const result = await model.generateContent(prompt);
+	return result.response.text() || "{}";
 }
 
 function cleanJsonResponse(content: string): string {
@@ -325,7 +291,6 @@ function cleanJsonResponse(content: string): string {
 
 async function generateSingleChunk(
 	transcriptText: string,
-	groqClient: ReturnType<typeof getGroqClient>,
 ): Promise<AiResult> {
 	const prompt = `You are Cap AI, an expert at analyzing video content and creating comprehensive summaries.
 
@@ -347,13 +312,12 @@ Return ONLY valid JSON without any markdown formatting or code blocks.
 Transcript:
 ${transcriptText}`;
 
-	const content = await callAiApi(prompt, groqClient);
+	const content = await callGemini(prompt);
 	return parseAiResponse(content);
 }
 
 async function generateMultipleChunks(
 	chunks: { text: string; startTime: number; endTime: number }[],
-	groqClient: ReturnType<typeof getGroqClient>,
 ): Promise<AiResult> {
 	const chunkSummaries: {
 		summary: string;
@@ -381,7 +345,7 @@ Return ONLY valid JSON without any markdown formatting or code blocks.
 Transcript section:
 ${chunk.text}`;
 
-		const chunkContent = await callAiApi(chunkPrompt, groqClient);
+		const chunkContent = await callGemini(chunkPrompt);
 		try {
 			const parsed = JSON.parse(cleanJsonResponse(chunkContent).trim());
 			chunkSummaries.push({
@@ -434,7 +398,7 @@ Provide JSON in the following format:
 The summary must be detailed and comprehensive - not a brief overview. Capture all the important information from every section.
 Return ONLY valid JSON without any markdown formatting or code blocks.`;
 
-	const finalContent = await callAiApi(finalPrompt, groqClient);
+	const finalContent = await callGemini(finalPrompt);
 	try {
 		const parsed = JSON.parse(cleanJsonResponse(finalContent).trim());
 		return {
