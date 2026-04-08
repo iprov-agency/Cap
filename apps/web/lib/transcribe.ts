@@ -22,10 +22,10 @@ export async function transcribeVideo(
 	aiGenerationEnabled = false,
 	_isRetry = false,
 ): Promise<TranscribeResult> {
-	if (!serverEnv().DEEPGRAM_API_KEY) {
+	if (!serverEnv().GOOGLE_API_KEY) {
 		return {
 			success: false,
-			message: "Missing necessary environment variables",
+			message: "Missing GOOGLE_API_KEY for Gemini transcription",
 		};
 	}
 

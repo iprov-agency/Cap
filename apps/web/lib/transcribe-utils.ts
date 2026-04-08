@@ -86,3 +86,68 @@ export function formatToWebVTT(result: DeepgramResult): string {
 
 	return output;
 }
+
+/**
+ * Convert Gemini transcription text response to WebVTT format.
+ * Gemini returns text with timestamp markers like [00:00] or (0:00).
+ * We parse these into proper VTT cues.
+ */
+export function geminiTextToWebVTT(text: string): string {
+	let output = "WEBVTT\n\n";
+	let captionIndex = 1;
+
+	// Try to parse timestamped lines from Gemini output
+	// Common formats: [00:00] text, (0:00) text, 00:00 - text, [00:00:00] text
+	const lines = text.split("\n").filter((l) => l.trim());
+
+	const timePattern =
+		/(?:\[|$$)?(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\]|$$)?[\s\-:]*(.+)/;
+
+	interface ParsedSegment {
+		startSeconds: number;
+		text: string;
+	}
+
+	const segments: ParsedSegment[] = [];
+
+	for (const line of lines) {
+		const match = line.match(timePattern);
+		if (match) {
+			const hours = match[3] ? parseInt(match[1] ?? "0", 10) : 0;
+			const minutes = match[3]
+				? parseInt(match[2] ?? "0", 10)
+				: parseInt(match[1] ?? "0", 10);
+			const seconds = match[3]
+				? parseInt(match[3], 10)
+				: parseInt(match[2] ?? "0", 10);
+			const startSeconds = hours * 3600 + minutes * 60 + seconds;
+			const segmentText = (match[4] ?? "").trim();
+			if (segmentText) {
+				segments.push({ startSeconds, text: segmentText });
+			}
+		}
+	}
+
+	// If no timestamps found, treat the whole text as a single cue
+	if (segments.length === 0 && text.trim()) {
+		output += `1\n00:00:00.000 --> 99:59:59.000\n${text.trim()}\n\n`;
+		return output;
+	}
+
+	for (let i = 0; i < segments.length; i++) {
+		const segment = segments[i];
+		if (!segment) continue;
+		const nextSegment = segments[i + 1];
+		const endSeconds = nextSegment
+			? nextSegment.startSeconds
+			: segment.startSeconds + 5;
+
+		const startTs = formatTimestamp(segment.startSeconds);
+		const endTs = formatTimestamp(endSeconds);
+
+		output += `${captionIndex}\n${startTs} --> ${endTs}\n${segment.text}\n\n`;
+		captionIndex++;
+	}
+
+	return output;
+}

@@ -16,10 +16,10 @@ export async function startAiGeneration(
 	videoId: Video.VideoId,
 	userId: string,
 ): Promise<GenerateAiResult> {
-	if (!serverEnv().GROQ_API_KEY && !serverEnv().OPENAI_API_KEY) {
+	if (!serverEnv().GOOGLE_API_KEY) {
 		return {
 			success: false,
-			message: "Missing AI API keys (Groq or OpenAI)",
+			message: "Missing GOOGLE_API_KEY for Gemini AI generation",
 		};
 	}
 
