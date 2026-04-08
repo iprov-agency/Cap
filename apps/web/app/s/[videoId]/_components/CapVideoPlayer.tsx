@@ -138,6 +138,7 @@ export function CapVideoPlayer({
 	const [hasPlayedOnce, setHasPlayedOnce] = useState(false);
 	const [isMobile, setIsMobile] = useState(false);
 	const [hasError, setHasError] = useState(false);
+	const [autoRetryCount, setAutoRetryCount] = useState(0);
 	const [isRetryingProcessing, setIsRetryingProcessing] = useState(false);
 	const [playerDuration, setPlayerDuration] = useState(fallbackDuration ?? 0);
 	const [preferredSource, setPreferredSource] = useState<"mp4" | "raw">("mp4");
@@ -249,6 +250,7 @@ export function CapVideoPlayer({
 	useEffect(() => {
 		if (resolvedSrc.data) {
 			setHasError(false);
+			setAutoRetryCount(0);
 			return;
 		}
 
@@ -266,6 +268,25 @@ export function CapVideoPlayer({
 		resolvedSrc.isSuccess,
 		uploadProgress,
 	]);
+
+	// Auto-retry when video source fails to load (handles race between
+	// upload completion and share page load)
+	useEffect(() => {
+		if (!hasError || autoRetryCount >= 5) return;
+
+		const timer = setTimeout(() => {
+			setAutoRetryCount((c) => c + 1);
+			setHasError(false);
+			setVideoLoaded(false);
+			setHasTriedRawFallback(false);
+			setPreferredSource("mp4");
+			queryClient.invalidateQueries({
+				queryKey: ["resolvedSrc"],
+			});
+		}, 3000);
+
+		return () => clearTimeout(timer);
+	}, [hasError, autoRetryCount, queryClient]);
 
 	useEffect(() => {
 		const video = videoRef.current;
