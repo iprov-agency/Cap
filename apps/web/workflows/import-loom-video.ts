@@ -277,10 +277,14 @@ async function startMediaServerProcessJob(
 		inputExtension?: string;
 	},
 ): Promise<string> {
+	const mediaServerSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET;
 	for (let attempt = 0; attempt < MEDIA_SERVER_START_MAX_ATTEMPTS; attempt++) {
 		const response = await fetch(`${mediaServerUrl}/video/process`, {
 			method: "POST",
-			headers: { "Content-Type": "application/json" },
+			headers: {
+				"Content-Type": "application/json",
+				...(mediaServerSecret ? { "x-media-server-secret": mediaServerSecret } : {}),
+			},
 			body: JSON.stringify(body),
 		});
 
@@ -379,6 +383,7 @@ async function pollForCompletion(
 ): Promise<MediaServerProcessResult> {
 	const maxAttempts = 360;
 	const pollIntervalMs = 5000;
+	const mediaServerSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET;
 
 	for (let attempt = 0; attempt < maxAttempts; attempt++) {
 		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
@@ -387,7 +392,10 @@ async function pollForCompletion(
 			`${mediaServerUrl}/video/process/${jobId}/status`,
 			{
 				method: "GET",
-				headers: { Accept: "application/json" },
+				headers: {
+					Accept: "application/json",
+					...(mediaServerSecret ? { "x-media-server-secret": mediaServerSecret } : {}),
+				},
 			},
 		);
 
