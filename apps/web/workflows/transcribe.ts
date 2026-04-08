@@ -14,7 +14,13 @@ import { S3Buckets } from "@cap/web-backend";
 import type { S3Bucket, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Option } from "effect";
-import { FatalError } from "workflow";
+// FatalError from workflow package not available without workflow runtime
+class FatalError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "FatalError";
+	}
+}
 import {
 	ENHANCED_AUDIO_CONTENT_TYPE,
 	ENHANCED_AUDIO_EXTENSION,

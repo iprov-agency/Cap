@@ -4,7 +4,6 @@ import type { VideoMetadata } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
-import { start } from "workflow/api";
 import { generateAiWorkflow } from "@/workflows/generate-ai";
 
 type GenerateAiResult = {
@@ -82,7 +81,10 @@ export async function startAiGeneration(
 			})
 			.where(eq(videos.id, videoId));
 
-		await start(generateAiWorkflow, [{ videoId, userId }]);
+		// Call workflow directly (bypass workflow RPC engine, not available in self-hosted)
+		generateAiWorkflow({ videoId, userId }).catch((err) => {
+			console.error(`[generateAi] Workflow failed for ${videoId}:`, err);
+		});
 
 		return {
 			success: true,

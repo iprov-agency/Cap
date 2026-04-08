@@ -8,7 +8,6 @@ import {
 import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
-import { start } from "workflow/api";
 import { transcribeVideoWorkflow } from "@/workflows/transcribe";
 
 type TranscribeResult = {
@@ -122,13 +121,14 @@ export async function transcribeVideo(
 			`[transcribeVideo] Triggering transcription workflow for video ${videoId}`,
 		);
 
-		await start(transcribeVideoWorkflow, [
-			{
-				videoId,
-				userId,
-				aiGenerationEnabled,
-			},
-		]);
+		// Call workflow directly (bypass workflow RPC engine, not available in self-hosted)
+		transcribeVideoWorkflow({
+			videoId,
+			userId,
+			aiGenerationEnabled,
+		}).catch((err) => {
+			console.error(`[transcribeVideo] Workflow failed for ${videoId}:`, err);
+		});
 
 		return {
 			success: true,
