@@ -117,25 +117,30 @@ export async function startVideoProcessingWorkflow({
 		return status;
 	}
 
-	try {
-		// Call workflow directly (bypass workflow RPC engine, not available in self-hosted)
-		await processVideoWorkflow({
-			videoId,
-			userId,
-			rawFileKey,
-			bucketId: bucketId as S3Bucket.S3BucketId | null,
-		});
-		return "started";
-	} catch (error) {
+	// Fire processing workflow without awaiting completion.
+	// The media-server webhook handler (api/webhooks/media-server/progress)
+	// handles progress updates, completion, metadata save, and upload record
+	// cleanup. Awaiting here blocked the HTTP response for up to 30 minutes
+	// and caused stuck upload records when the connection was dropped.
+	processVideoWorkflow({
+		videoId,
+		userId,
+		rawFileKey,
+		bucketId: bucketId as S3Bucket.S3BucketId | null,
+	}).catch(async (error) => {
 		const normalizedError =
 			error instanceof Error
 				? error
 				: new Error("Video processing could not start");
+		console.error(
+			`[video-processing] Background workflow failed for ${videoId}:`,
+			normalizedError,
+		);
 		await setVideoProcessingError(
 			videoId,
 			startFailureMessage,
 			normalizedError,
 		);
-		throw normalizedError;
-	}
+	});
+	return "started";
 }
