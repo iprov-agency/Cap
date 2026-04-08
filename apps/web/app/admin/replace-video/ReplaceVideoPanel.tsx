@@ -19,12 +19,6 @@ function uploadWithPresignedPost(
 	onProgress: (percent: number) => void,
 ): Promise<void> {
 	return new Promise((resolve, reject) => {
-		const formData = new FormData();
-		for (const [key, value] of Object.entries(postData.fields)) {
-			formData.append(key, value);
-		}
-		formData.append("file", file);
-
 		const xhr = new XMLHttpRequest();
 
 		xhr.upload.addEventListener("progress", (e) => {
@@ -45,8 +39,9 @@ function uploadWithPresignedPost(
 			reject(new Error("Upload failed"));
 		});
 
-		xhr.open("POST", postData.url);
-		xhr.send(formData);
+		xhr.open("PUT", postData.url);
+		xhr.setRequestHeader("Content-Type", file.type || "video/mp4");
+		xhr.send(file);
 	});
 }
 

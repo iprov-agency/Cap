@@ -84,18 +84,21 @@ export async function createVideoForServerProcessing({
 		Option.map((id) => S3Bucket.S3BucketId.make(id)),
 	);
 
-	const presignedPostData = await Effect.gen(function* () {
+	const presignedPutUrl = await Effect.gen(function* () {
 		const [bucket] = yield* S3Buckets.getBucketAccess(bucketIdOption);
 
-		return yield* bucket.getPresignedPostUrl(rawFileKey, {
-			Fields: {
-				"Content-Type": "video/mp4",
-				"x-amz-meta-userid": user.id,
-				"x-amz-meta-duration": duration?.toString() ?? "",
-				"x-amz-meta-resolution": resolution ?? "",
+		return yield* bucket.getPresignedPutUrl(
+			rawFileKey,
+			{
+				ContentType: "video/mp4",
+				Metadata: {
+					userid: user.id,
+					duration: duration?.toString() ?? "",
+					resolution: resolution ?? "",
+				},
 			},
-			Expires: 3600,
-		});
+			{ expiresIn: 3600 },
+		);
 	}).pipe(runPromise);
 
 	if (buildEnv.NEXT_PUBLIC_IS_CAP && NODE_ENV === "production") {
@@ -118,6 +121,6 @@ export async function createVideoForServerProcessing({
 		id: videoId,
 		rawFileKey,
 		bucketId: customBucket?.id ?? null,
-		presignedPostData,
+		presignedPostData: { url: presignedPutUrl, fields: {} },
 	};
 }

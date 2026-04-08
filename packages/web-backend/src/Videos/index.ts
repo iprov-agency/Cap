@@ -431,19 +431,22 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 
 					const fileKey = `${user.id}/${videoId}/result.mp4`;
 					const [bucket] = yield* s3Buckets.getBucketAccess(bucketId);
-					const presignedPostData = yield* bucket.getPresignedPostUrl(fileKey, {
-						Fields: {
-							"Content-Type": "video/mp4",
-							"x-amz-meta-userid": user.id,
-							"x-amz-meta-duration": input.durationSeconds
-								? input.durationSeconds.toString()
-								: "",
-							"x-amz-meta-resolution": input.resolution ?? "",
-							"x-amz-meta-videocodec": input.videoCodec ?? "",
-							"x-amz-meta-audiocodec": input.audioCodec ?? "",
+					const presignedPutUrl = yield* bucket.getPresignedPutUrl(
+						fileKey,
+						{
+							ContentType: "video/mp4",
+							Metadata: {
+								userid: user.id,
+								duration: input.durationSeconds
+									? input.durationSeconds.toString()
+									: "",
+								resolution: input.resolution ?? "",
+								videocodec: input.videoCodec ?? "",
+								audiocodec: input.audioCodec ?? "",
+							},
 						},
-						Expires: 1800,
-					});
+						{ expiresIn: 1800 },
+					);
 
 					const shareUrl = `${serverEnv().WEB_URL}/s/${videoId}`;
 
@@ -464,8 +467,8 @@ export class Videos extends Effect.Service<Videos>()("Videos", {
 						id: videoId,
 						shareUrl,
 						upload: {
-							url: presignedPostData.url,
-							fields: presignedPostData.fields,
+							url: presignedPutUrl,
+							fields: {},
 						},
 					};
 				},

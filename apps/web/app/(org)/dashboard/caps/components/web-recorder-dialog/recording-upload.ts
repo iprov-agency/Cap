@@ -20,14 +20,9 @@ export const uploadRecording = (
 				? blob
 				: new File([blob], "result.mp4", { type: "video/mp4" });
 
-		const formData = new FormData();
-		Object.entries(upload.fields).forEach(([key, value]) => {
-			formData.append(key, value);
-		});
-		formData.append("file", fileBlob, "result.mp4");
-
 		const xhr = new XMLHttpRequest();
-		xhr.open("POST", upload.url);
+		xhr.open("PUT", upload.url);
+		xhr.setRequestHeader("Content-Type", "video/mp4");
 
 		xhr.upload.onprogress = (event) => {
 			if (event.lengthComputable) {
@@ -63,5 +58,5 @@ export const uploadRecording = (
 			reject(new Error("Upload failed due to network error"));
 		};
 
-		xhr.send(formData);
+		xhr.send(fileBlob);
 	});

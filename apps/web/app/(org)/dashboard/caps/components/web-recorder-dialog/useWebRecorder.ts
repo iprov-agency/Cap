@@ -1303,18 +1303,6 @@ export const useWebRecorder = ({
 								orgId: Organisation.OrganisationId.make(orgId),
 							});
 
-							const screenshotFormData = new FormData();
-							Object.entries(screenshotData.presignedPostData.fields).forEach(
-								([key, value]) => {
-									screenshotFormData.append(key, value as string);
-								},
-							);
-							screenshotFormData.append(
-								"file",
-								thumbnailBlob,
-								"screen-capture.jpg",
-							);
-
 							setUploadStatus({
 								status: "uploadingThumbnail",
 								capId: creationResult.id,
@@ -1323,7 +1311,8 @@ export const useWebRecorder = ({
 
 							await new Promise<void>((resolve, reject) => {
 								const xhr = new XMLHttpRequest();
-								xhr.open("POST", screenshotData.presignedPostData.url);
+								xhr.open("PUT", screenshotData.presignedPostData.url);
+								xhr.setRequestHeader("Content-Type", "image/jpeg");
 
 								xhr.upload.onprogress = (event) => {
 									if (event.lengthComputable) {
@@ -1352,7 +1341,7 @@ export const useWebRecorder = ({
 									reject(new Error("Screenshot upload failed"));
 								};
 
-								xhr.send(screenshotFormData);
+								xhr.send(thumbnailBlob);
 							});
 
 							queryClient.refetchQueries({

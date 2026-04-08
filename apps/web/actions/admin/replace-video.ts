@@ -50,15 +50,16 @@ export async function getVideoReplaceUploadUrl(videoId: string) {
 		Option.map((id) => S3Bucket.S3BucketId.make(id)),
 	);
 
-	const presignedPostData = await Effect.gen(function* () {
+	const presignedPutUrl = await Effect.gen(function* () {
 		const [bucket] = yield* S3Buckets.getBucketAccess(bucketIdOption);
-		return yield* bucket.getPresignedPostUrl(fileKey, {
-			Fields: { "Content-Type": "video/mp4" },
-			Expires: 1800,
-		});
+		return yield* bucket.getPresignedPutUrl(
+			fileKey,
+			{ ContentType: "video/mp4" },
+			{ expiresIn: 1800 },
+		);
 	}).pipe(runPromise);
 
-	return { presignedPostData };
+	return { presignedPostData: { url: presignedPutUrl, fields: {} } };
 }
 
 export async function invalidateVideoCache(videoId: string) {

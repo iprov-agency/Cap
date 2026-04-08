@@ -88,27 +88,32 @@ async function getVideoUploadPresignedUrl({
 						? "audio/mpeg"
 						: fileKey.endsWith(".m3u8")
 							? "application/x-mpegURL"
-							: "video/mp2t";
+							: fileKey.endsWith(".jpg") || fileKey.endsWith(".jpeg")
+								? "image/jpeg"
+								: fileKey.endsWith(".png")
+									? "image/png"
+									: "video/mp2t";
 
-		const Fields = {
-			"Content-Type": contentType,
-			"x-amz-meta-userid": userId,
-			"x-amz-meta-duration": duration ?? "",
-			"x-amz-meta-resolution": resolution ?? "",
-			"x-amz-meta-videocodec": videoCodec ?? "",
-			"x-amz-meta-audiocodec": audioCodec ?? "",
-		};
-
-		const presignedPostData = await Effect.gen(function* () {
+		const presignedPutUrl = await Effect.gen(function* () {
 			const [bucket] = yield* S3Buckets.getBucketAccess(bucketIdOption);
 
-			return yield* bucket.getPresignedPostUrl(fileKey, {
-				Fields,
-				Expires: 1800,
-			});
+			return yield* bucket.getPresignedPutUrl(
+				fileKey,
+				{
+					ContentType: contentType,
+					Metadata: {
+						userid: userId,
+						duration: duration ?? "",
+						resolution: resolution ?? "",
+						videocodec: videoCodec ?? "",
+						audiocodec: audioCodec ?? "",
+					},
+				},
+				{ expiresIn: 1800 },
+			);
 		}).pipe(runPromise);
 
-		return { presignedPostData };
+		return { presignedPostData: { url: presignedPutUrl, fields: {} } };
 	} catch (error) {
 		console.error("Error getting presigned URL:", error);
 		throw new Error(

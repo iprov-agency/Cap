@@ -243,14 +243,6 @@ async function uploadVideoForServerProcessing(
 			thumbnailUrl: undefined,
 		});
 
-		const formData = new FormData();
-		Object.entries(videoData.presignedPostData.fields).forEach(
-			([key, value]) => {
-				formData.append(key, value as string);
-			},
-		);
-		formData.append("file", file);
-
 		const createProgressTracker = () => {
 			const uploadState = {
 				videoId: uploadId,
@@ -303,7 +295,8 @@ async function uploadVideoForServerProcessing(
 		try {
 			await new Promise<void>((resolve, reject) => {
 				const xhr = new XMLHttpRequest();
-				xhr.open("POST", videoData.presignedPostData.url);
+				xhr.open("PUT", videoData.presignedPostData.url);
+				xhr.setRequestHeader("Content-Type", file.type || "video/mp4");
 
 				xhr.upload.onprogress = (event) => {
 					if (event.lengthComputable) {
@@ -335,7 +328,7 @@ async function uploadVideoForServerProcessing(
 					reject(new Error("Upload failed"));
 				};
 
-				xhr.send(formData);
+				xhr.send(file);
 			});
 		} catch (uploadError) {
 			progressTracker.cleanup();
