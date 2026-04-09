@@ -17,7 +17,11 @@ import {
 	MultipartCompletionUncertainError,
 } from "./instant-mp4-uploader";
 import type { RecordingMode } from "./RecordingModeSelector";
-import { captureThumbnail, convertToMp4 } from "./recording-conversion";
+import {
+	captureStreamThumbnail,
+	captureThumbnail,
+	convertToMp4,
+} from "./recording-conversion";
 import {
 	canUseRecordingSpool,
 	deleteRecoveredRecordingSpool,
@@ -76,6 +80,7 @@ interface UseWebRecorderOptions {
 
 const INSTANT_UPLOAD_REQUEST_INTERVAL_MS = 1000;
 const INSTANT_CHUNK_GUARD_DELAY_MS = INSTANT_UPLOAD_REQUEST_INTERVAL_MS * 3;
+const THUMBNAIL_CAPTURE_DELAY_MS = 2000;
 
 type InstantChunkingMode = "manual" | "timeslice";
 type InstantVideoCreation = {
@@ -122,6 +127,44 @@ const triggerBrowserDownload = (url: string, fileName: string) => {
 };
 
 const recoveredToastId = (id: string) => `recovered-${id}`;
+
+const uploadStreamThumbnail = async ({
+	stream,
+	videoId,
+	orgId,
+	queryClient,
+	signal,
+}: {
+	stream: MediaStream;
+	videoId: VideoId;
+	orgId: string;
+	queryClient: ReturnType<typeof useQueryClient>;
+	signal: AbortSignal;
+}) => {
+	const thumbnailBlob = await captureStreamThumbnail(stream);
+	if (!thumbnailBlob) return;
+
+	const screenshotData = await createVideoAndGetUploadUrl({
+		videoId,
+		isScreenshot: true,
+		orgId: Organisation.OrganisationId.make(orgId),
+	});
+
+	const response = await fetch(screenshotData.presignedPostData.url, {
+		method: "PUT",
+		headers: { "Content-Type": "image/jpeg" },
+		body: thumbnailBlob,
+		signal,
+	});
+
+	if (!response.ok) {
+		throw new Error(`Screenshot upload failed with status ${response.status}`);
+	}
+
+	queryClient.refetchQueries({
+		queryKey: ThumbnailRequest.queryKey(videoId),
+	});
+};
 
 export const useWebRecorder = ({
 	organisationId,
@@ -251,6 +294,8 @@ export const useWebRecorder = ({
 	const recordingSpoolDegradingRef = useRef(false);
 	const recordingSpoolWarningShownRef = useRef(false);
 	const recoveredDownloadUrlsRef = useRef(new Map<string, string>());
+	const thumbnailCaptureTimeoutRef = useRef<number | null>(null);
+	const thumbnailUploadAbortRef = useRef<AbortController | null>(null);
 
 	const isStreamingPipelineActive = useCallback(
 		() => recordingPipelineRef.current?.mode === "streaming-webm",
@@ -563,6 +608,17 @@ export const useWebRecorder = ({
 		[onPhaseChange],
 	);
 
+	const cancelThumbnailCapture = useCallback(() => {
+		if (thumbnailCaptureTimeoutRef.current !== null) {
+			window.clearTimeout(thumbnailCaptureTimeoutRef.current);
+			thumbnailCaptureTimeoutRef.current = null;
+		}
+		if (thumbnailUploadAbortRef.current) {
+			thumbnailUploadAbortRef.current.abort();
+			thumbnailUploadAbortRef.current = null;
+		}
+	}, []);
+
 	const cleanupRecordingState = useCallback(async () => {
 		cleanupStreams();
 		clearTimer();
@@ -570,6 +626,7 @@ export const useWebRecorder = ({
 		resetTimer();
 		stopInstantChunkInterval();
 		clearInstantChunkGuard();
+		cancelThumbnailCapture();
 		instantChunkModeRef.current = null;
 		lastInstantChunkAtRef.current = null;
 		recordingPipelineRef.current = null;
@@ -607,6 +664,7 @@ export const useWebRecorder = ({
 		resetTimer,
 		stopInstantChunkInterval,
 		clearInstantChunkGuard,
+		cancelThumbnailCapture,
 		disposeRecordingSpool,
 		deletePendingVideoSafely,
 		setUploadStatus,
@@ -1064,6 +1122,39 @@ export const useWebRecorder = ({
 
 			startTimer();
 			updatePhase("recording");
+
+			if (pipeline.mode === "streaming-webm" && videoCreationRef.current) {
+				const captureVideoId = videoCreationRef.current.id;
+				const captureOrgId = organisationId;
+				const captureStream =
+					recordingMode === "camera"
+						? cameraStreamRef.current
+						: displayStreamRef.current;
+
+				if (captureStream && captureOrgId) {
+					cancelThumbnailCapture();
+					thumbnailCaptureTimeoutRef.current = window.setTimeout(() => {
+						thumbnailCaptureTimeoutRef.current = null;
+						const abortController = new AbortController();
+						thumbnailUploadAbortRef.current = abortController;
+						void uploadStreamThumbnail({
+							stream: captureStream,
+							videoId: captureVideoId,
+							orgId: captureOrgId,
+							queryClient,
+							signal: abortController.signal,
+						}).catch((error) => {
+							if (
+								error instanceof DOMException &&
+								error.name === "AbortError"
+							) {
+								return;
+							}
+							console.error("Failed to capture/upload stream thumbnail", error);
+						});
+					}, THUMBNAIL_CAPTURE_DELAY_MS);
+				}
+			}
 		} catch (err) {
 			const orphanVideoId = videoCreationRef.current?.id ?? null;
 			if (instantUploaderRef.current) {
@@ -1133,6 +1224,7 @@ export const useWebRecorder = ({
 	const stopRecording = useCallback(async () => {
 		stopInstantChunkInterval();
 		clearInstantChunkGuard();
+		cancelThumbnailCapture();
 		instantChunkModeRef.current = null;
 		lastInstantChunkAtRef.current = null;
 		replaceErrorDownload(null);
@@ -1271,10 +1363,7 @@ export const useWebRecorder = ({
 					throw new Error("Failed to prepare recording for upload");
 				}
 
-				const thumbnailBlob = await captureThumbnail(processedRecordingBlob, {
-					width,
-					height,
-				});
+				const thumbnailBlob = await captureThumbnail(processedRecordingBlob);
 				const thumbnailPreviewUrl = thumbnailBlob
 					? URL.createObjectURL(thumbnailBlob)
 					: undefined;
@@ -1309,45 +1398,43 @@ export const useWebRecorder = ({
 								progress: 90,
 							});
 
-							await new Promise<void>((resolve, reject) => {
-								const xhr = new XMLHttpRequest();
-								xhr.open("PUT", screenshotData.presignedPostData.url);
-								xhr.setRequestHeader("Content-Type", "image/jpeg");
+							const thumbnailAbort = new AbortController();
+							thumbnailUploadAbortRef.current = thumbnailAbort;
 
-								xhr.upload.onprogress = (event) => {
-									if (event.lengthComputable) {
-										const percent = 90 + (event.loaded / event.total) * 10;
-										setUploadStatus({
-											status: "uploadingThumbnail",
-											capId: creationResult.id,
-											progress: percent,
-										});
-									}
-								};
+							const thumbnailResponse = await fetch(
+								screenshotData.presignedPostData.url,
+								{
+									method: "PUT",
+									headers: { "Content-Type": "image/jpeg" },
+									body: thumbnailBlob,
+									signal: thumbnailAbort.signal,
+								},
+							);
 
-								xhr.onload = () => {
-									if (xhr.status >= 200 && xhr.status < 300) {
-										resolve();
-									} else {
-										reject(
-											new Error(
-												`Screenshot upload failed with status ${xhr.status}`,
-											),
-										);
-									}
-								};
+							thumbnailUploadAbortRef.current = null;
 
-								xhr.onerror = () => {
-									reject(new Error("Screenshot upload failed"));
-								};
+							if (!thumbnailResponse.ok) {
+								throw new Error(
+									`Screenshot upload failed with status ${thumbnailResponse.status}`,
+								);
+							}
 
-								xhr.send(thumbnailBlob);
+							setUploadStatus({
+								status: "uploadingThumbnail",
+								capId: creationResult.id,
+								progress: 100,
 							});
 
 							queryClient.refetchQueries({
 								queryKey: ThumbnailRequest.queryKey(creationResult.id),
 							});
 						} catch (thumbnailError) {
+							if (
+								thumbnailError instanceof DOMException &&
+								thumbnailError.name === "AbortError"
+							) {
+								return;
+							}
 							console.error("Failed to upload thumbnail", thumbnailError);
 							toast.warning(
 								"Recording uploaded, but thumbnail failed to upload.",
@@ -1434,6 +1521,7 @@ export const useWebRecorder = ({
 		resolveFailureBlob,
 		disposeRecordingSpool,
 		clearInstantChunkGuard,
+		cancelThumbnailCapture,
 	]);
 
 	useEffect(() => {

@@ -4,11 +4,99 @@ import type { VideoId } from "./web-recorder-types";
 const MAX_THUMBNAIL_WIDTH = 1000;
 const MAX_THUMBNAIL_HEIGHT = 562;
 const JPEG_QUALITY = 0.65;
+const STREAM_THUMBNAIL_TIMEOUT_MS = 8000;
 
-export const captureThumbnail = (
-	source: Blob,
-	dimensions: { width?: number; height?: number },
-) =>
+const renderFrameToJpeg = (video: HTMLVideoElement): Promise<Blob | null> =>
+	new Promise((resolve) => {
+		try {
+			const sourceWidth = video.videoWidth;
+			const sourceHeight = video.videoHeight;
+			if (sourceWidth <= 0 || sourceHeight <= 0) {
+				resolve(null);
+				return;
+			}
+			const canvas = document.createElement("canvas");
+			const scale = Math.min(
+				MAX_THUMBNAIL_WIDTH / sourceWidth,
+				MAX_THUMBNAIL_HEIGHT / sourceHeight,
+				1,
+			);
+			const width = Math.round(sourceWidth * scale);
+			const height = Math.round(sourceHeight * scale);
+			canvas.width = width;
+			canvas.height = height;
+			const ctx = canvas.getContext("2d");
+			if (!ctx) {
+				resolve(null);
+				return;
+			}
+			ctx.drawImage(video, 0, 0, width, height);
+			canvas.toBlob(
+				(blob) => {
+					resolve(blob ?? null);
+				},
+				"image/jpeg",
+				JPEG_QUALITY,
+			);
+		} catch {
+			resolve(null);
+		}
+	});
+
+export const captureStreamThumbnail = (stream: MediaStream) =>
+	new Promise<Blob | null>((resolve) => {
+		const videoTracks = stream.getVideoTracks();
+		if (videoTracks.length === 0 || videoTracks[0]?.readyState !== "live") {
+			resolve(null);
+			return;
+		}
+
+		const video = document.createElement("video");
+		video.muted = true;
+		video.playsInline = true;
+		video.srcObject = new MediaStream(videoTracks);
+
+		let timeoutId: number;
+		let resolved = false;
+
+		const finalize = (result: Blob | null) => {
+			if (resolved) return;
+			resolved = true;
+			window.clearTimeout(timeoutId);
+			video.pause();
+			video.srcObject = null;
+			resolve(result);
+		};
+
+		timeoutId = window.setTimeout(
+			() => finalize(null),
+			STREAM_THUMBNAIL_TIMEOUT_MS,
+		);
+
+		video.addEventListener(
+			"error",
+			() => {
+				finalize(null);
+			},
+			{ once: true },
+		);
+
+		const attemptCapture = () => {
+			void renderFrameToJpeg(video).then(finalize);
+		};
+
+		if ("requestVideoFrameCallback" in video) {
+			video.requestVideoFrameCallback(attemptCapture);
+		} else {
+			video.addEventListener("loadeddata", attemptCapture, { once: true });
+		}
+
+		void video.play().catch(() => {
+			finalize(null);
+		});
+	});
+
+export const captureThumbnail = (source: Blob) =>
 	new Promise<Blob | null>((resolve) => {
 		const video = document.createElement("video");
 		const objectUrl = URL.createObjectURL(source);
@@ -59,9 +147,13 @@ export const captureThumbnail = (
 			"seeked",
 			() => {
 				try {
+					const sourceWidth = video.videoWidth;
+					const sourceHeight = video.videoHeight;
+					if (sourceWidth <= 0 || sourceHeight <= 0) {
+						finalize(null);
+						return;
+					}
 					const canvas = document.createElement("canvas");
-					const sourceWidth = video.videoWidth || dimensions.width || 640;
-					const sourceHeight = video.videoHeight || dimensions.height || 360;
 					const scale = Math.min(
 						MAX_THUMBNAIL_WIDTH / sourceWidth,
 						MAX_THUMBNAIL_HEIGHT / sourceHeight,
