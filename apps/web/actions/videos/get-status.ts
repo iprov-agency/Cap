@@ -373,7 +373,7 @@ export async function getVideoStatus(
 		normalizedTranscriptionStatus === "COMPLETE" &&
 		!normalizedAiGenerationStatus &&
 		!metadata.summary &&
-		(serverEnv().GROQ_API_KEY || serverEnv().OPENAI_API_KEY);
+		serverEnv().GOOGLE_API_KEY;
 
 	if (shouldTriggerAiGeneration) {
 		const aiResult = await triggerAiGenerationIfEligible(
