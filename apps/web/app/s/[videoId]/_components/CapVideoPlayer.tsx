@@ -48,6 +48,10 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "./video/tooltip";
 
 const { circumference } = getProgressCircleConfig();
 
+const PLACEHOLDER_SVG = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="224" height="128"><rect fill="%231f2937" width="224" height="128"/></svg>')}`;
+
+const ERROR_SVG = `data:image/svg+xml,${encodeURIComponent('<svg xmlns="http://www.w3.org/2000/svg" width="224" height="128"><rect fill="%23dc2626" width="224" height="128"/></svg>')}`;
+
 function getProgressStatusText(
 	status: "uploading" | "processing" | "generating_thumbnail",
 ) {
@@ -145,6 +149,16 @@ export function CapVideoPlayer({
 	const [hasTriedRawFallback, setHasTriedRawFallback] = useState(false);
 	const queryClient = useQueryClient();
 
+	const previewVideoRef = useRef<HTMLVideoElement>(null);
+	const previewCanvasRef = useRef<HTMLCanvasElement | null>(null);
+	const scrubThumbnailRef = useRef<{
+		time: number;
+		src: string;
+		videoUrl: string;
+	} | null>(null);
+	const pendingPreviewSeekRef = useRef<number | null>(null);
+	const [, setScrubThumbnailVersion] = useState(0);
+
 	useEffect(() => {
 		const checkMobile = () => {
 			setIsMobile(window.innerWidth < 640);
@@ -201,7 +215,6 @@ export function CapVideoPlayer({
 		setHasTriedRawFallback(false);
 	}, [videoSrc, rawFallbackSrc]);
 
-	// Track video duration for comment markers
 	useEffect(() => {
 		setPlayerDuration(fallbackDuration ?? 0);
 	}, [fallbackDuration]);
@@ -227,11 +240,9 @@ export function CapVideoPlayer({
 		};
 	}, [videoRef]);
 
-	// Track when all data is ready for comment markers
 	const [markersReady, setMarkersReady] = useState(false);
 	const [hoveredComment, setHoveredComment] = useState<string | null>(null);
 
-	// Memoize hover handlers to prevent render loops
 	const handleMouseEnter = useCallback((commentId: string) => {
 		setHoveredComment(commentId);
 	}, []);
@@ -241,7 +252,6 @@ export function CapVideoPlayer({
 	}, []);
 
 	useEffect(() => {
-		// Only show markers when we have duration, comments, and video element
 		if (playerDuration > 0 && comments.length > 0 && videoRef.current) {
 			setMarkersReady(true);
 		}
@@ -269,8 +279,6 @@ export function CapVideoPlayer({
 		uploadProgress,
 	]);
 
-	// Auto-retry when video source fails to load (handles race between
-	// upload completion and share page load)
 	useEffect(() => {
 		if (!hasError || autoRetryCount >= 5) return;
 
@@ -331,7 +339,6 @@ export function CapVideoPlayer({
 			setHasError(true);
 		};
 
-		// Caption track setup
 		let captionTrack: TextTrack | null = null;
 
 		const handleCueChange = (): void => {
@@ -357,7 +364,6 @@ export function CapVideoPlayer({
 			}
 		};
 
-		// Ensure all caption tracks remain hidden
 		const ensureTracksHidden = (): void => {
 			const tracks = Array.from(video.textTracks);
 			for (const track of tracks) {
@@ -424,28 +430,80 @@ export function CapVideoPlayer({
 
 	const generateVideoFrameThumbnail = useCallback(
 		(time: number): string => {
-			const video = videoRef.current;
-
-			if (!video) {
-				return `https://placeholder.pics/svg/224x128/1f2937/ffffff/Loading ${Math.floor(time)}s`;
+			const currentVideoUrl = resolvedSrc.data?.url ?? "";
+			const cached = scrubThumbnailRef.current;
+			if (
+				cached &&
+				Math.abs(cached.time - time) < 0.01 &&
+				cached.videoUrl === currentVideoUrl
+			) {
+				return cached.src;
 			}
 
-			const canvas = document.createElement("canvas");
-			canvas.width = 224;
-			canvas.height = 128;
-			const ctx = canvas.getContext("2d");
+			const preview = previewVideoRef.current;
+			if (!preview || preview.readyState < 1) {
+				return PLACEHOLDER_SVG;
+			}
 
-			if (ctx) {
-				try {
-					ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-					return canvas.toDataURL("image/jpeg", 0.8);
-				} catch (_error) {
-					return `https://placeholder.pics/svg/224x128/dc2626/ffffff/Error`;
+			if (
+				pendingPreviewSeekRef.current !== null &&
+				Math.abs(pendingPreviewSeekRef.current - time) < 0.01
+			) {
+				if (cached && cached.videoUrl === currentVideoUrl) {
+					return cached.src;
 				}
+				return PLACEHOLDER_SVG;
 			}
-			return `https://placeholder.pics/svg/224x128/dc2626/ffffff/Error`;
+
+			pendingPreviewSeekRef.current = time;
+
+			const seekAndCapture = () => {
+				const onSeeked = () => {
+					preview.onseeked = null;
+
+					if (!previewCanvasRef.current) {
+						previewCanvasRef.current = document.createElement("canvas");
+					}
+					const canvas = previewCanvasRef.current;
+					canvas.width = 224;
+					canvas.height = 128;
+					const ctx = canvas.getContext("2d");
+
+					if (ctx) {
+						try {
+							ctx.drawImage(preview, 0, 0, canvas.width, canvas.height);
+							const src = canvas.toDataURL("image/jpeg", 0.8);
+							scrubThumbnailRef.current = {
+								time,
+								src,
+								videoUrl: currentVideoUrl,
+							};
+						} catch (_e) {
+							scrubThumbnailRef.current = {
+								time,
+								src: ERROR_SVG,
+								videoUrl: currentVideoUrl,
+							};
+						}
+					}
+
+					pendingPreviewSeekRef.current = null;
+					setScrubThumbnailVersion((v) => v + 1);
+				};
+
+				preview.onseeked = onSeeked;
+				const safeTime = Math.min(Math.max(time, 0), preview.duration || time);
+				preview.currentTime = safeTime;
+			};
+
+			seekAndCapture();
+
+			if (cached && cached.videoUrl === currentVideoUrl) {
+				return cached.src;
+			}
+			return PLACEHOLDER_SVG;
 		},
-		[videoRef.current],
+		[resolvedSrc.data?.url],
 	);
 
 	const isUploadFailed = uploadProgress?.status === "failed";
@@ -525,7 +583,11 @@ export function CapVideoPlayer({
 		(!hasError || isAutoRetrying) &&
 		(!resolvedSrc.isSuccess || Boolean(resolvedSrc.data));
 	const showPlaybackResolutionError =
-		hasError && !isAutoRetrying && !uploadProgress && !resolvedSrc.data && !resolvedSrc.isPending;
+		hasError &&
+		!isAutoRetrying &&
+		!uploadProgress &&
+		!resolvedSrc.data &&
+		!resolvedSrc.isPending;
 	const showRawPlaybackBadge =
 		showPlaybackStatusBadge && resolvedSrc.data?.type === "raw";
 	const rawPlaybackBadgeLabel =
@@ -637,6 +699,21 @@ export function CapVideoPlayer({
 						/>
 					)}
 				</MediaPlayerVideo>
+			)}
+			{resolvedSrc.data && (
+				<video
+					ref={previewVideoRef}
+					src={resolvedSrc.data.url}
+					crossOrigin={
+						resolvedSrc.data.supportsCrossOrigin ? "anonymous" : undefined
+					}
+					preload="metadata"
+					muted
+					playsInline
+					style={{ display: "none" }}
+				>
+					<track kind="captions" />
+				</video>
 			)}
 			<AnimatePresence>
 				{!videoLoaded && hasActiveProgress && !showUploadFailureOverlay && (
@@ -788,12 +865,7 @@ export function CapVideoPlayer({
 						<MediaPlayerPlay />
 						<MediaPlayerSeekBackward />
 						<MediaPlayerSeekForward />
-						<MediaPlayerVolume
-							expandable
-							// enhancedAudioEnabled={enhancedAudioEnabled}
-							// enhancedAudioMuted={enhancedAudioMuted}
-							// setEnhancedAudioMuted={setEnhancedAudioMuted}
-						/>
+						<MediaPlayerVolume expandable />
 						<MediaPlayerTime fallbackDuration={playerDuration} />
 					</div>
 					<div className="flex gap-2 items-center">
@@ -803,15 +875,7 @@ export function CapVideoPlayer({
 								toggleCaptions={toggleCaptions}
 							/>
 						)}
-						{/* <MediaPlayerEnhancedAudio
-							enhancedAudioStatus={enhancedAudioStatus}
-							enhancedAudioEnabled={enhancedAudioEnabled}
-							setEnhancedAudioEnabled={setEnhancedAudioEnabled}
-						/> */}
 						<MediaPlayerSettings
-							// enhancedAudioStatus={enhancedAudioStatus}
-							// enhancedAudioEnabled={enhancedAudioEnabled}
-							// setEnhancedAudioEnabled={setEnhancedAudioEnabled}
 							captionLanguage={captionLanguage}
 							onCaptionLanguageChange={onCaptionLanguageChange}
 							availableCaptions={availableCaptions}
@@ -823,24 +887,6 @@ export function CapVideoPlayer({
 					</div>
 				</div>
 			</MediaPlayerControls>
-			{/* {enhancedAudioUrl && (
-				<>
-					<audio
-						ref={enhancedAudioRef}
-						src={enhancedAudioUrl}
-						preload="auto"
-						className="hidden"
-					>
-						<track kind="captions" />
-					</audio>
-					<EnhancedAudioSync
-						enhancedAudioRef={enhancedAudioRef}
-						videoRef={videoRef}
-						enhancedAudioEnabled={enhancedAudioEnabled}
-						enhancedAudioMuted={enhancedAudioMuted}
-					/>
-				</>
-			)} */}
 		</MediaPlayer>
 	);
 }
