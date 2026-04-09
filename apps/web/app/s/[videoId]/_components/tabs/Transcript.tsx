@@ -23,10 +23,15 @@ import { useCurrentUser } from "@/app/Layout/AuthContext";
 import type { VideoData } from "../../types";
 import { type CaptionLanguage, useCaptionContext } from "../CaptionContext";
 
+type TranscriptionProgress = "EXTRACTING" | "TRANSCRIBING" | "SUMMARIZING";
+
 interface TranscriptProps {
 	data: VideoData;
 	onSeek?: (time: number) => void;
 	user?: { id: string } | null;
+	transcriptionProgress?: TranscriptionProgress | null;
+	transcriptionError?: string | null;
+	transcriptionProgressStartedAt?: string | null;
 }
 
 interface TranscriptEntry {
@@ -40,7 +45,8 @@ const parseVTT = (vttContent: string): TranscriptEntry[] => {
 	const lines = vttContent.split("\n");
 	const entries: TranscriptEntry[] = [];
 	let currentEntry: Partial<TranscriptEntry & { startTime: number }> = {};
-	let currentId = 0;
+	let nextId = 0;
+	let currentId: number | null = null;
 
 	const timeToSeconds = (timeStr: string): number | null => {
 		const parts = timeStr.split(":");
@@ -61,7 +67,7 @@ const parseVTT = (vttContent: string): TranscriptEntry[] => {
 
 	const parseTimestamp = (
 		timestamp: string,
-	): { mm_ss: string; totalSeconds: number } | null => {
+	): { displayTime: string; totalSeconds: number } | null => {
 		const parts = timestamp.split(":");
 		if (parts.length !== 3) return null;
 
@@ -76,8 +82,11 @@ const parseVTT = (vttContent: string): TranscriptEntry[] => {
 		);
 		if (totalSeconds === null) return null;
 
+		const totalMinutes = Math.floor(totalSeconds / 60);
+		const displaySeconds = totalSeconds % 60;
+
 		return {
-			mm_ss: `${minutesStr}:${secondsPart}`,
+			displayTime: `${totalMinutes}:${displaySeconds.toString().padStart(2, "0")}`,
 			totalSeconds,
 		};
 	};
@@ -101,11 +110,13 @@ const parseVTT = (vttContent: string): TranscriptEntry[] => {
 
 			const startTimestamp = parseTimestamp(startTimeStr);
 			if (startTimestamp) {
+				const resolvedId = currentId ?? ++nextId;
 				currentEntry = {
-					id: currentId,
-					timestamp: startTimestamp.mm_ss,
+					id: resolvedId,
+					timestamp: startTimestamp.displayTime,
 					startTime: startTimestamp.totalSeconds,
 				};
+				currentId = null;
 			}
 			continue;
 		}
@@ -133,7 +144,51 @@ const parseVTT = (vttContent: string): TranscriptEntry[] => {
 	return sortedEntries;
 };
 
-export const Transcript: React.FC<TranscriptProps> = ({ data, onSeek }) => {
+const PROGRESS_LABELS: Record<TranscriptionProgress, string> = {
+	EXTRACTING: "Extracting audio...",
+	TRANSCRIBING: "Transcribing...",
+	SUMMARIZING: "Generating summary...",
+};
+
+const ElapsedTimer = ({ startedAt }: { startedAt: string }) => {
+	const [elapsed, setElapsed] = useState(0);
+
+	useEffect(() => {
+		const startTime = new Date(startedAt).getTime();
+		if (Number.isNaN(startTime)) {
+			return;
+		}
+		const update = () => {
+			const now = Date.now();
+			const delta = Math.max(0, now - startTime);
+			setElapsed(Math.floor(delta / 1000));
+		};
+		update();
+		const interval = setInterval(update, 1000);
+		return () => clearInterval(interval);
+	}, [startedAt]);
+
+	const minutes = Math.floor(elapsed / 60);
+	const seconds = elapsed % 60;
+
+	if (minutes > 0) {
+		return (
+			<span className="text-xs text-gray-8">
+				{minutes}m {seconds.toString().padStart(2, "0")}s
+			</span>
+		);
+	}
+
+	return <span className="text-xs text-gray-8">{seconds}s</span>;
+};
+
+export const Transcript: React.FC<TranscriptProps> = ({
+	data,
+	onSeek,
+	transcriptionProgress,
+	transcriptionError,
+	transcriptionProgressStartedAt,
+}) => {
 	const user = useCurrentUser();
 	const queryClient = useQueryClient();
 	const captionContext = useCaptionContext();
@@ -399,6 +454,14 @@ export const Transcript: React.FC<TranscriptProps> = ({ data, onSeek }) => {
 	const canEdit = user?.id === data.owner.id && selectedLanguage === "original";
 
 	if (isTranscriptionProcessing && !hasTimedOut) {
+		const progressLabel = transcriptionProgress
+			? PROGRESS_LABELS[transcriptionProgress]
+			: "Transcription in progress...";
+
+		const showElapsed =
+			transcriptionProgress === "TRANSCRIBING" &&
+			transcriptionProgressStartedAt;
+
 		return (
 			<div className="flex justify-center items-center h-full text-gray-1">
 				<div className="text-center">
@@ -426,7 +489,12 @@ export const Transcript: React.FC<TranscriptProps> = ({ data, onSeek }) => {
 							/>
 						</svg>
 					</div>
-					<p>Transcription in progress...</p>
+					<p className="text-sm font-medium text-gray-12">{progressLabel}</p>
+					{showElapsed && (
+						<div className="mt-1">
+							<ElapsedTimer startedAt={transcriptionProgressStartedAt} />
+						</div>
+					)}
 				</div>
 			</div>
 		);
@@ -526,15 +594,27 @@ export const Transcript: React.FC<TranscriptProps> = ({ data, onSeek }) => {
 			transcriptError);
 
 	if (showRetryButton) {
+		const errorDetail =
+			data.transcriptionStatus === "ERROR" && transcriptionError
+				? transcriptionError
+				: data.transcriptionStatus === "ERROR"
+					? "Transcription failed"
+					: "No transcript available";
+
 		return (
 			<div className="flex justify-center items-center h-full text-gray-1">
-				<div className="text-center">
+				<div className="text-center px-4">
 					<MessageSquare className="mx-auto mb-2 w-8 h-8 text-gray-300" />
-					<p className="mb-4 text-sm font-medium text-gray-12">
+					<p className="mb-2 text-sm font-medium text-gray-12">
 						{data.transcriptionStatus === "ERROR"
-							? "Transcript not available"
+							? "Transcription failed"
 							: "No transcript available"}
 					</p>
+					{data.transcriptionStatus === "ERROR" && transcriptionError && (
+						<p className="mb-4 text-xs text-gray-9 max-w-[240px] mx-auto break-words">
+							{transcriptionError}
+						</p>
+					)}
 					{canEdit && (
 						<>
 							<Button
