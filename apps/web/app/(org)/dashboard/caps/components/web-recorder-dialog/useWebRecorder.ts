@@ -9,6 +9,7 @@ import { toast } from "sonner";
 import { createVideoAndGetUploadUrl } from "@/actions/video/upload";
 import { useEffectMutation, useRpcClient } from "@/lib/EffectRuntime";
 import { ThumbnailRequest } from "@/lib/Requests/ThumbnailRequest";
+import { createStreamingTranscription } from "@/lib/streaming-transcription";
 import { useUploadingContext } from "../../UploadingContext";
 import { sendProgressUpdate } from "../sendProgressUpdate";
 import {
@@ -296,6 +297,9 @@ export const useWebRecorder = ({
 	const recoveredDownloadUrlsRef = useRef(new Map<string, string>());
 	const thumbnailCaptureTimeoutRef = useRef<number | null>(null);
 	const thumbnailUploadAbortRef = useRef<AbortController | null>(null);
+	const streamingTranscriptionRef = useRef<ReturnType<
+		typeof createStreamingTranscription
+	> | null>(null);
 
 	const isStreamingPipelineActive = useCallback(
 		() => recordingPipelineRef.current?.mode === "streaming-webm",
@@ -627,6 +631,15 @@ export const useWebRecorder = ({
 		stopInstantChunkInterval();
 		clearInstantChunkGuard();
 		cancelThumbnailCapture();
+		if (streamingTranscriptionRef.current) {
+			streamingTranscriptionRef.current.stop().catch((err) => {
+				console.error(
+					"Failed to stop streaming transcription during cleanup",
+					err,
+				);
+			});
+			streamingTranscriptionRef.current = null;
+		}
 		instantChunkModeRef.current = null;
 		lastInstantChunkAtRef.current = null;
 		recordingPipelineRef.current = null;
@@ -1120,6 +1133,18 @@ export const useWebRecorder = ({
 			}
 			onRecordingStart?.();
 
+			if (hasAudio && videoCreationRef.current) {
+				try {
+					const transcription = createStreamingTranscription(
+						videoCreationRef.current.id,
+					);
+					transcription.start(mixedStream);
+					streamingTranscriptionRef.current = transcription;
+				} catch (err) {
+					console.error("Failed to start streaming transcription", err);
+				}
+			}
+
 			startTimer();
 			updatePhase("recording");
 
@@ -1254,6 +1279,15 @@ export const useWebRecorder = ({
 			const instantUploader = instantUploaderRef.current;
 
 			onRecordingStop?.();
+
+			const streamingTranscription = streamingTranscriptionRef.current;
+			streamingTranscriptionRef.current = null;
+			if (streamingTranscription) {
+				streamingTranscription.stop().catch((err) => {
+					console.error("Streaming transcription finalization failed", err);
+				});
+			}
+
 			updatePhase("creating");
 
 			rawRecordingBlob = await stopRecordingInternalWrapper();
