@@ -2,8 +2,11 @@ import { db } from "@cap/database";
 import { organizations, s3Buckets, videos } from "@cap/database/schema";
 import type { VideoMetadata } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
+import { S3Buckets } from "@cap/web-backend";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
+import { Cause, Exit, Option } from "effect";
+import { runPromise } from "@/lib/server";
 import { transcribeVideoWorkflow } from "@/workflows/transcribe";
 
 type TranscribeResult = {
@@ -42,6 +45,64 @@ async function markTranscriptionError(
 			`[transcribeVideo] Failed to save error status for ${videoId}:`,
 			dbErr,
 		);
+	}
+}
+
+function isS3NotFoundError(err: unknown): boolean {
+	if (Exit.isExit(err) && Exit.isFailure(err)) {
+		const cause = err.cause;
+		if (Cause.isFailType(cause)) {
+			const s3Error = cause.error;
+			if (s3Error && typeof s3Error === "object" && "cause" in s3Error) {
+				const underlying = (s3Error as { cause: unknown }).cause;
+				if (
+					underlying &&
+					typeof underlying === "object" &&
+					"name" in underlying
+				) {
+					const name = (underlying as { name: string }).name;
+					return name === "NotFound" || name === "NoSuchKey";
+				}
+				if (
+					underlying &&
+					typeof underlying === "object" &&
+					"$metadata" in underlying
+				) {
+					const metadata = (
+						underlying as { $metadata: { httpStatusCode?: number } }
+					).$metadata;
+					return metadata?.httpStatusCode === 404;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+async function checkStreamingTranscriptExists(
+	videoId: string,
+	userId: string,
+	bucketId: string | null,
+): Promise<boolean> {
+	try {
+		const [bucket] = await S3Buckets.getBucketAccess(
+			Option.fromNullable(bucketId),
+		).pipe(runPromise);
+
+		await bucket
+			.headObject(`${userId}/${videoId}/transcription.vtt`)
+			.pipe(runPromise);
+
+		return true;
+	} catch (err) {
+		if (isS3NotFoundError(err)) {
+			return false;
+		}
+		console.error(
+			`[transcribeVideo] S3 error checking streaming transcript for ${videoId}:`,
+			err,
+		);
+		return false;
 	}
 }
 
@@ -125,6 +186,33 @@ export async function transcribeVideo(
 		return {
 			success: true,
 			message: "Transcription already completed",
+		};
+	}
+
+	const streamingTranscriptExists = await checkStreamingTranscriptExists(
+		videoId,
+		video.ownerId,
+		result.bucket?.id ?? null,
+	);
+
+	if (streamingTranscriptExists) {
+		console.log(
+			`[transcribeVideo] Streaming transcript already exists for ${videoId}, marking COMPLETE`,
+		);
+		try {
+			await db()
+				.update(videos)
+				.set({ transcriptionStatus: "COMPLETE" })
+				.where(eq(videos.id, videoId));
+		} catch (dbErr) {
+			console.error(
+				`[transcribeVideo] Failed to mark streaming transcript as complete:`,
+				dbErr,
+			);
+		}
+		return {
+			success: true,
+			message: "Streaming transcript already exists",
 		};
 	}
 
