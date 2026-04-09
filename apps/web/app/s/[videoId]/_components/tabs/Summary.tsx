@@ -5,6 +5,7 @@ import type { Video } from "@cap/web-domain";
 import {
 	faRectangleList,
 	faRotateRight,
+	faWandMagicSparkles,
 } from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/react-fontawesome";
 import { useState } from "react";
@@ -34,6 +35,7 @@ interface SummaryProps {
 	aiGenerationEnabled?: boolean;
 	isSummaryDisabled?: boolean;
 	ownerIsPro: boolean;
+	transcriptionStatus?: string | null;
 }
 
 const formatTime = (time: number) => {
@@ -79,6 +81,7 @@ export const Summary: React.FC<SummaryProps> = ({
 	isSummaryDisabled = false,
 	aiGenerationEnabled = false,
 	ownerIsPro,
+	transcriptionStatus,
 }) => {
 	const [isRetrying, setIsRetrying] = useState(false);
 	const [retryError, setRetryError] = useState<string | null>(null);
@@ -94,6 +97,12 @@ export const Summary: React.FC<SummaryProps> = ({
 
 	const canRetry =
 		aiGenerationStatus === "ERROR" || aiGenerationStatus === "SKIPPED";
+
+	const canGenerate =
+		transcriptionStatus === "COMPLETE" &&
+		!aiGenerationStatus &&
+		!aiData?.summary &&
+		!aiData?.chapters?.length;
 
 	const handleSeek = (time: number) => {
 		if (onSeek) {
@@ -223,6 +232,25 @@ export const Summary: React.FC<SummaryProps> = ({
 							)}
 						</div>
 					)}
+					{canGenerate && (
+						<div className="pt-4">
+							<Button
+								variant="primary"
+								size="sm"
+								onClick={handleRetry}
+								disabled={isRetrying}
+							>
+								<FontAwesomeIcon
+									icon={faWandMagicSparkles}
+									className={`mr-2 ${isRetrying ? "animate-spin" : ""}`}
+								/>
+								{isRetrying ? "Generating..." : "Generate Summary"}
+							</Button>
+							{retryError && (
+								<p className="mt-2 text-sm text-red-500">{retryError}</p>
+							)}
+						</div>
+					)}
 				</div>
 			</div>
 		);
@@ -253,8 +281,16 @@ export const Summary: React.FC<SummaryProps> = ({
 								{aiData.chapters.map((chapter) => (
 									<div
 										key={chapter.start}
+										role="button"
+										tabIndex={0}
 										className="flex items-center p-2 rounded transition-colors cursor-pointer hover:bg-gray-100"
 										onClick={() => handleSeek(chapter.start)}
+										onKeyDown={(e) => {
+											if (e.key === "Enter" || e.key === " ") {
+												e.preventDefault();
+												handleSeek(chapter.start);
+											}
+										}}
 									>
 										<span className="w-16 text-xs text-gray-500">
 											{formatTime(chapter.start)}
