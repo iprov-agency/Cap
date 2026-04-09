@@ -22,6 +22,7 @@ import { Hono, type MiddlewareHandler } from "hono";
 import { z } from "zod";
 import { withAuth } from "@/app/api/utils";
 import { runPromise } from "@/lib/server";
+import { transcribeVideo } from "@/lib/transcribe";
 import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { stringOrNumberOptional } from "@/utils/zod";
 import {
@@ -43,7 +44,6 @@ const abortRequestSchema = z
 	.and(
 		z.union([
 			z.object({ videoId: z.string(), subpath: z.string().optional() }),
-			// deprecated
 			z.object({ fileKey: z.string() }),
 		]),
 	);
@@ -64,13 +64,14 @@ app.post(
 	"/initiate",
 	zValidator(
 		"json",
-		z.object({ contentType: z.string() }).and(
-			z.union([
-				z.object({ videoId: z.string(), subpath: z.string().optional() }),
-				// deprecated
-				z.object({ fileKey: z.string() }),
-			]),
-		),
+		z
+			.object({ contentType: z.string() })
+			.and(
+				z.union([
+					z.object({ videoId: z.string(), subpath: z.string().optional() }),
+					z.object({ fileKey: z.string() }),
+				]),
+			),
 	),
 	async (c) => {
 		const { contentType, ...body } = c.req.valid("json");
@@ -186,13 +187,11 @@ app.post(
 			.object({
 				uploadId: z.string(),
 				partNumber: z.number(),
-				// deprecated
 				md5Sum: z.string().optional(),
 			})
 			.and(
 				z.union([
 					z.object({ videoId: z.string(), subpath: z.string().optional() }),
-					// deprecated
 					z.object({ fileKey: z.string() }),
 				]),
 			),
@@ -267,25 +266,27 @@ app.post(
 			.and(
 				z.union([
 					z.object({ videoId: z.string(), subpath: z.string().optional() }),
-					// deprecated
 					z.object({ fileKey: z.string() }),
 				]),
 			),
 	),
-	(c) => {
+	async (c) => {
 		const { uploadId, parts, ...body } = c.req.valid("json");
 		const user = c.get("user");
 
-		return Effect.gen(function* () {
+		const fileKey = getMultipartFileKey(user.id, body);
+		const videoIdFromFileKey = fileKey.split("/")[1];
+		const videoIdRaw = "videoId" in body ? body.videoId : videoIdFromFileKey;
+
+		let uploadSucceeded = false;
+
+		const response = await Effect.gen(function* () {
 			const repo = yield* VideosRepo;
 			const policy = yield* VideosPolicy;
 			const db = yield* Database;
 
-			const fileKey = getMultipartFileKey(user.id, body);
 			const subpath = getSubpath(body) ?? "result.mp4";
 
-			const videoIdFromFileKey = fileKey.split("/")[1];
-			const videoIdRaw = "videoId" in body ? body.videoId : videoIdFromFileKey;
 			if (!videoIdRaw) return c.text("Video id not found", 400);
 			const videoId = Video.VideoId.make(videoIdRaw);
 
@@ -567,6 +568,8 @@ app.post(
 						}
 					}
 
+					uploadSucceeded = true;
+
 					return c.json({
 						location: result.Location,
 						success: true,
@@ -615,6 +618,17 @@ app.post(
 			provideOptionalAuth,
 			runPromiseAnyEnv,
 		);
+
+		if (videoIdRaw && uploadSucceeded) {
+			transcribeVideo(Video.VideoId.make(videoIdRaw), user.id).catch((err) => {
+				console.error(
+					`[multipart] Transcription trigger failed for ${videoIdRaw}:`,
+					err,
+				);
+			});
+		}
+
+		return response;
 	},
 );
 

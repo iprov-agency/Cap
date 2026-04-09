@@ -1,10 +1,6 @@
 import { db } from "@cap/database";
-import {
-	organizations,
-	s3Buckets,
-	videos,
-	videoUploads,
-} from "@cap/database/schema";
+import { organizations, s3Buckets, videos } from "@cap/database/schema";
+import type { VideoMetadata } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import type { Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
@@ -14,6 +10,8 @@ type TranscribeResult = {
 	success: boolean;
 	message: string;
 };
+
+const PROCESSING_TIMEOUT_MS = 2 * 60 * 1000;
 
 export async function transcribeVideo(
 	videoId: Video.VideoId,
@@ -83,37 +81,37 @@ export async function transcribeVideo(
 		}
 		return {
 			success: true,
-			message: "Transcription disabled for video — skipping transcription",
+			message: "Transcription disabled for video, skipping transcription",
 		};
 	}
 
 	if (
 		video.transcriptionStatus === "COMPLETE" ||
-		video.transcriptionStatus === "PROCESSING" ||
 		video.transcriptionStatus === "SKIPPED" ||
 		video.transcriptionStatus === "NO_AUDIO"
 	) {
 		return {
 			success: true,
-			message: "Transcription already completed or in progress",
+			message: "Transcription already completed",
 		};
 	}
 
-	const upload = await db()
-		.select({ phase: videoUploads.phase })
-		.from(videoUploads)
-		.where(eq(videoUploads.videoId, videoId))
-		.limit(1);
-
-	if (
-		upload[0]?.phase === "uploading" ||
-		upload[0]?.phase === "processing" ||
-		upload[0]?.phase === "generating_thumbnail"
-	) {
-		return {
-			success: true,
-			message: "Video upload is still in progress",
-		};
+	if (video.transcriptionStatus === "PROCESSING") {
+		const metadata = (video.metadata ?? {}) as VideoMetadata;
+		const startedAt = metadata.transcriptionStartedAt;
+		if (startedAt && Date.now() - startedAt < PROCESSING_TIMEOUT_MS) {
+			return {
+				success: true,
+				message: "Transcription already in progress",
+			};
+		}
+		console.log(
+			`[transcribeVideo] PROCESSING status stale for ${videoId}, resetting`,
+		);
+		await db()
+			.update(videos)
+			.set({ transcriptionStatus: null })
+			.where(eq(videos.id, videoId));
 	}
 
 	try {
@@ -121,7 +119,6 @@ export async function transcribeVideo(
 			`[transcribeVideo] Triggering transcription workflow for video ${videoId}`,
 		);
 
-		// Call workflow directly (bypass workflow RPC engine, not available in self-hosted)
 		transcribeVideoWorkflow({
 			videoId,
 			userId,

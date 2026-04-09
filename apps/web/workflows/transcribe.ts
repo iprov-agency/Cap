@@ -12,26 +12,24 @@ import { serverEnv } from "@cap/env";
 import { userIsPro } from "@cap/utils";
 import { S3Buckets } from "@cap/web-backend";
 import type { S3Bucket, Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { Option } from "effect";
-// FatalError from workflow package not available without workflow runtime
+
 class FatalError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "FatalError";
 	}
 }
+
 import {
 	ENHANCED_AUDIO_CONTENT_TYPE,
 	ENHANCED_AUDIO_EXTENSION,
 	enhanceAudioFromUrl,
 } from "@/lib/audio-enhance";
 import { checkHasAudioTrack, extractAudioFromUrl } from "@/lib/audio-extract";
+import { GEMINI_AUDIO_MODEL, getGeminiClient } from "@/lib/gemini-client";
 import { startAiGeneration } from "@/lib/generate-ai";
-import {
-	GEMINI_AUDIO_MODEL,
-	getGeminiClient,
-} from "@/lib/gemini-client";
 import {
 	checkHasAudioTrackViaMediaServer,
 	extractAudioViaMediaServer,
@@ -57,57 +55,55 @@ interface VideoData {
 export async function transcribeVideoWorkflow(
 	payload: TranscribeWorkflowPayload,
 ) {
-
 	const { videoId, userId, aiGenerationEnabled } = payload;
 
 	const videoData = await validateVideo(videoId);
 
-	if (videoData.transcriptionDisabled) {
-		await markSkipped(videoId);
-		return { success: true, message: "Transcription disabled - skipped" };
+	let audioKey: string | null = null;
+	try {
+		if (videoData.transcriptionDisabled) {
+			await markSkipped(videoId);
+			return { success: true, message: "Transcription disabled - skipped" };
+		}
+
+		const extracted = await extractAudio(videoId, userId, videoData.bucketId);
+
+		if (!extracted) {
+			await markNoAudio(videoId);
+			return {
+				success: true,
+				message: "Video has no audio track - skipped transcription",
+			};
+		}
+
+		audioKey = extracted.audioKey;
+
+		const [transcription] = await Promise.all([
+			transcribeWithGemini(extracted.audioUrl),
+		]);
+
+		await saveTranscription(videoId, userId, videoData.bucketId, transcription);
+
+		if (aiGenerationEnabled) {
+			await queueAiGeneration(videoId, userId);
+		}
+
+		return { success: true, message: "Transcription completed successfully" };
+	} catch (error) {
+		console.error(`[transcribe] Workflow failed for ${videoId}:`, error);
+		await db()
+			.update(videos)
+			.set({ transcriptionStatus: null })
+			.where(eq(videos.id, videoId as Video.VideoId));
+		throw error;
+	} finally {
+		if (audioKey) {
+			await cleanupTempAudio(audioKey, videoData.bucketId).catch(() => {});
+		}
 	}
-
-	const audioUrl = await extractAudio(videoId, userId, videoData.bucketId);
-
-	if (!audioUrl) {
-		await markNoAudio(videoId);
-		return {
-			success: true,
-			message: "Video has no audio track - skipped transcription",
-		};
-	}
-
-	// const enhancementConfigured = isAudioEnhancementConfigured();
-	// const shouldEnhanceAudio = videoData.isOwnerPro && enhancementConfigured;
-
-	// console.log(
-	// 	`[transcribe] Audio enhancement check: isOwnerPro=${videoData.isOwnerPro}, configured=${enhancementConfigured}, shouldEnhance=${shouldEnhanceAudio}`,
-	// );
-
-	// if (shouldEnhanceAudio) {
-	// 	await markEnhancedAudioProcessing(videoId);
-	// }
-
-	const [transcription] = await Promise.all([
-		transcribeWithGemini(audioUrl),
-		// shouldEnhanceAudio
-		// 	? enhanceAndSaveAudio(videoId, userId, audioUrl, videoData.bucketId)
-		// 	: Promise.resolve(),
-	]);
-
-	await saveTranscription(videoId, userId, videoData.bucketId, transcription);
-
-	await cleanupTempAudio(videoId, userId, videoData.bucketId);
-
-	if (aiGenerationEnabled) {
-		await queueAiGeneration(videoId, userId);
-	}
-
-	return { success: true, message: "Transcription completed successfully" };
 }
 
 async function validateVideo(videoId: string): Promise<VideoData> {
-
 	if (!serverEnv().GOOGLE_API_KEY) {
 		throw new FatalError("Missing GOOGLE_API_KEY for Gemini transcription");
 	}
@@ -148,7 +144,10 @@ async function validateVideo(videoId: string): Promise<VideoData> {
 
 	await db()
 		.update(videos)
-		.set({ transcriptionStatus: "PROCESSING" })
+		.set({
+			transcriptionStatus: "PROCESSING",
+			metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.transcriptionStartedAt', ${Date.now()})`,
+		})
 		.where(eq(videos.id, videoId as Video.VideoId));
 
 	return {
@@ -160,7 +159,6 @@ async function validateVideo(videoId: string): Promise<VideoData> {
 }
 
 async function markSkipped(videoId: string): Promise<void> {
-
 	await db()
 		.update(videos)
 		.set({ transcriptionStatus: "SKIPPED" })
@@ -168,7 +166,6 @@ async function markSkipped(videoId: string): Promise<void> {
 }
 
 async function markNoAudio(videoId: string): Promise<void> {
-
 	await db()
 		.update(videos)
 		.set({ transcriptionStatus: "NO_AUDIO" })
@@ -179,8 +176,7 @@ async function extractAudio(
 	videoId: string,
 	userId: string,
 	bucketId: S3Bucket.S3BucketId | null,
-): Promise<string | null> {
-
+): Promise<{ audioUrl: string; audioKey: string } | null> {
 	const [bucket] = await S3Buckets.getBucketAccess(
 		Option.fromNullable(bucketId),
 	).pipe(runPromise);
@@ -255,7 +251,7 @@ async function extractAudio(
 		.getInternalSignedObjectUrl(audioKey)
 		.pipe(runPromise);
 
-	return audioSignedUrl;
+	return { audioUrl: audioSignedUrl, audioKey };
 }
 
 async function resolveVideoSourceUrl(
@@ -276,29 +272,25 @@ async function resolveVideoSourceUrl(
 	const candidateKeys = [
 		`${userId}/${videoId}/result.mp4`,
 		upload[0]?.rawFileKey,
+		`${userId}/${videoId}/raw-upload.webm`,
 	].filter(
 		(value, index, values): value is string =>
 			Boolean(value) && values.indexOf(value) === index,
 	);
 
 	for (const key of candidateKeys) {
-		const url = await bucket.getInternalSignedObjectUrl(key).pipe(runPromise);
-		const response = await fetch(url, {
-			method: "GET",
-			headers: { range: "bytes=0-0" },
-		});
-
-		if (response.ok) {
+		try {
+			await bucket.headObject(key).pipe(runPromise);
+			const url = await bucket.getInternalSignedObjectUrl(key).pipe(runPromise);
 			console.log(`[transcribe] Using video source ${key}`);
 			return url;
-		}
+		} catch {}
 	}
 
 	throw new Error("Video file not accessible");
 }
 
 async function transcribeWithGemini(audioUrl: string): Promise<string> {
-
 	const gemini = getGeminiClient();
 	if (!gemini) {
 		throw new Error("Gemini client not configured");
@@ -349,7 +341,6 @@ async function saveTranscription(
 	bucketId: S3Bucket.S3BucketId | null,
 	transcription: string,
 ): Promise<void> {
-
 	const [bucket] = await S3Buckets.getBucketAccess(
 		Option.fromNullable(bucketId),
 	).pipe(runPromise);
@@ -367,13 +358,9 @@ async function saveTranscription(
 }
 
 async function cleanupTempAudio(
-	videoId: string,
-	userId: string,
+	audioKey: string,
 	bucketId: S3Bucket.S3BucketId | null,
 ): Promise<void> {
-
-	const audioKey = `${userId}/${videoId}/audio-temp.mp3`;
-
 	try {
 		const [bucket] = await S3Buckets.getBucketAccess(
 			Option.fromNullable(bucketId),
@@ -392,12 +379,10 @@ async function queueAiGeneration(
 	videoId: string,
 	userId: string,
 ): Promise<void> {
-
 	await startAiGeneration(videoId as Video.VideoId, userId);
 }
 
 async function _markEnhancedAudioProcessing(videoId: string): Promise<void> {
-
 	const [video] = await db()
 		.select({ metadata: videos.metadata })
 		.from(videos)
@@ -422,7 +407,6 @@ async function _enhanceAndSaveAudio(
 	audioUrl: string,
 	bucketId: S3Bucket.S3BucketId | null,
 ): Promise<void> {
-
 	console.log(`[transcribe] Starting audio enhancement for video ${videoId}`);
 
 	try {
