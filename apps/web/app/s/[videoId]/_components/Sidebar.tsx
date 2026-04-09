@@ -26,6 +26,8 @@ type AiGenerationStatus =
 	| "ERROR"
 	| "SKIPPED";
 
+type TranscriptionProgress = "EXTRACTING" | "TRANSCRIBING" | "SUMMARIZING";
+
 interface SidebarProps {
 	data: VideoData;
 	commentsData: CommentType[];
@@ -44,6 +46,9 @@ interface SidebarProps {
 		aiGenerationStatus?: AiGenerationStatus | null;
 	} | null;
 	aiGenerationEnabled?: boolean;
+	transcriptionProgress?: TranscriptionProgress | null;
+	transcriptionError?: string | null;
+	transcriptionProgressStartedAt?: string | null;
 }
 
 const TabContent = motion.div;
@@ -84,6 +89,9 @@ export const Sidebar = forwardRef<{ scrollToBottom: () => void }, SidebarProps>(
 			onSeek,
 			aiData,
 			aiGenerationEnabled = false,
+			transcriptionProgress,
+			transcriptionError,
+			transcriptionProgressStartedAt,
 		},
 		ref,
 	) => {
@@ -180,7 +188,15 @@ export const Sidebar = forwardRef<{ scrollToBottom: () => void }, SidebarProps>(
 						/>
 					);
 				case "transcript":
-					return <Transcript data={data} onSeek={onSeek} />;
+					return (
+						<Transcript
+							data={data}
+							onSeek={onSeek}
+							transcriptionProgress={transcriptionProgress}
+							transcriptionError={transcriptionError}
+							transcriptionProgressStartedAt={transcriptionProgressStartedAt}
+						/>
+					);
 				case "settings":
 					return <Settings />;
 				default:

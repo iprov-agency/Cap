@@ -27,6 +27,8 @@ type AiGenerationStatus =
 	| "ERROR"
 	| "SKIPPED";
 
+type TranscriptionProgress = "EXTRACTING" | "TRANSCRIBING" | "SUMMARIZING";
+
 export interface VideoStatusResult {
 	transcriptionStatus: TranscriptionStatus | null;
 	aiGenerationStatus: AiGenerationStatus | null;
@@ -34,6 +36,9 @@ export interface VideoStatusResult {
 	summary: string | null;
 	chapters: { title: string; start: number }[] | null;
 	error?: string;
+	transcriptionProgress?: TranscriptionProgress | null;
+	transcriptionError?: string | null;
+	transcriptionProgressStartedAt?: string | null;
 }
 
 export async function getVideoStatus(
@@ -73,7 +78,6 @@ export async function getVideoStatus(
 			const isStale = ageMs > 5 * 60 * 1000;
 
 			if (isStale && upload.phase === "uploading") {
-				// Upload is stuck. Clean it up so transcription can proceed.
 				console.log(
 					`[Get Status] Cleaning up stale upload record for video ${videoId} (phase: ${upload.phase}, age: ${Math.round(ageMs / 1000)}s)`,
 				);
@@ -88,6 +92,9 @@ export async function getVideoStatus(
 					aiTitle: metadata.aiTitle || null,
 					summary: metadata.summary || null,
 					chapters: metadata.chapters || null,
+					transcriptionProgress: null,
+					transcriptionError: null,
+					transcriptionProgressStartedAt: null,
 				};
 			}
 		}
@@ -110,6 +117,11 @@ export async function getVideoStatus(
 				aiTitle: metadata.aiTitle || null,
 				summary: metadata.summary || null,
 				chapters: metadata.chapters || null,
+				transcriptionProgress:
+					(metadata.transcriptionProgress as TranscriptionProgress) ?? null,
+				transcriptionError: metadata.transcriptionError ?? null,
+				transcriptionProgressStartedAt:
+					metadata.transcriptionProgressStartedAt ?? null,
 			};
 		} catch (error) {
 			console.error(
@@ -124,6 +136,9 @@ export async function getVideoStatus(
 				summary: metadata.summary || null,
 				chapters: metadata.chapters || null,
 				error: "Failed to start transcription",
+				transcriptionProgress: null,
+				transcriptionError: "Failed to start transcription",
+				transcriptionProgressStartedAt: null,
 			};
 		}
 	}
@@ -136,7 +151,10 @@ export async function getVideoStatus(
 			aiTitle: metadata.aiTitle || null,
 			summary: metadata.summary || null,
 			chapters: metadata.chapters || null,
-			error: "Transcription failed",
+			error: metadata.transcriptionError || "Transcription failed",
+			transcriptionProgress: null,
+			transcriptionError: metadata.transcriptionError ?? null,
+			transcriptionProgressStartedAt: null,
 		};
 	}
 
@@ -177,6 +195,11 @@ export async function getVideoStatus(
 					aiTitle: metadata.aiTitle || null,
 					summary: metadata.summary || null,
 					chapters: metadata.chapters || null,
+					transcriptionProgress:
+						(metadata.transcriptionProgress as TranscriptionProgress) ?? null,
+					transcriptionError: null,
+					transcriptionProgressStartedAt:
+						metadata.transcriptionProgressStartedAt ?? null,
 				};
 			}
 		} catch (error) {
@@ -195,5 +218,10 @@ export async function getVideoStatus(
 		aiTitle: metadata.aiTitle || null,
 		summary: metadata.summary || null,
 		chapters: metadata.chapters || null,
+		transcriptionProgress:
+			(metadata.transcriptionProgress as TranscriptionProgress) ?? null,
+		transcriptionError: metadata.transcriptionError ?? null,
+		transcriptionProgressStartedAt:
+			metadata.transcriptionProgressStartedAt ?? null,
 	};
 }

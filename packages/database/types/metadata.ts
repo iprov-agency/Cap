@@ -12,6 +12,9 @@ export interface VideoMetadata {
 		| "SKIPPED";
 	enhancedAudioStatus?: "PROCESSING" | "COMPLETE" | "ERROR" | "SKIPPED";
 	transcriptionStartedAt?: number;
+	transcriptionProgress?: "EXTRACTING" | "TRANSCRIBING" | "SUMMARIZING";
+	transcriptionError?: string;
+	transcriptionProgressStartedAt?: string;
 }
 
 export interface SpaceMetadata {

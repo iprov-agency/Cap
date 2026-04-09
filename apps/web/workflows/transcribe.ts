@@ -52,6 +52,51 @@ interface VideoData {
 	isOwnerPro: boolean;
 }
 
+async function updateTranscriptionProgress(
+	videoId: string,
+	progress: "EXTRACTING" | "TRANSCRIBING" | "SUMMARIZING",
+): Promise<void> {
+	const [video] = await db()
+		.select({ metadata: videos.metadata })
+		.from(videos)
+		.where(eq(videos.id, videoId as Video.VideoId));
+
+	const currentMetadata = (video?.metadata as VideoMetadata) || {};
+
+	await db()
+		.update(videos)
+		.set({
+			metadata: {
+				...currentMetadata,
+				transcriptionProgress: progress,
+				transcriptionProgressStartedAt: new Date().toISOString(),
+				transcriptionError: undefined,
+			},
+		})
+		.where(eq(videos.id, videoId as Video.VideoId));
+}
+
+async function clearTranscriptionProgress(videoId: string): Promise<void> {
+	const [video] = await db()
+		.select({ metadata: videos.metadata })
+		.from(videos)
+		.where(eq(videos.id, videoId as Video.VideoId));
+
+	const currentMetadata = (video?.metadata as VideoMetadata) || {};
+
+	await db()
+		.update(videos)
+		.set({
+			metadata: {
+				...currentMetadata,
+				transcriptionProgress: undefined,
+				transcriptionProgressStartedAt: undefined,
+				transcriptionError: undefined,
+			},
+		})
+		.where(eq(videos.id, videoId as Video.VideoId));
+}
+
 export async function transcribeVideoWorkflow(
 	payload: TranscribeWorkflowPayload,
 ) {
@@ -66,9 +111,12 @@ export async function transcribeVideoWorkflow(
 			return { success: true, message: "Transcription disabled - skipped" };
 		}
 
+		await updateTranscriptionProgress(videoId, "EXTRACTING");
+
 		const extracted = await extractAudio(videoId, userId, videoData.bucketId);
 
 		if (!extracted) {
+			await clearTranscriptionProgress(videoId);
 			await markNoAudio(videoId);
 			return {
 				success: true,
@@ -78,6 +126,8 @@ export async function transcribeVideoWorkflow(
 
 		audioKey = extracted.audioKey;
 
+		await updateTranscriptionProgress(videoId, "TRANSCRIBING");
+
 		const [transcription] = await Promise.all([
 			transcribeWithGemini(extracted.audioUrl),
 		]);
@@ -85,8 +135,13 @@ export async function transcribeVideoWorkflow(
 		await saveTranscription(videoId, userId, videoData.bucketId, transcription);
 
 		if (aiGenerationEnabled) {
-			await queueAiGeneration(videoId, userId);
+			await updateTranscriptionProgress(videoId, "SUMMARIZING");
+			await queueAiGeneration(videoId, userId).catch((err) => {
+				console.error("[transcribe] AI generation enqueue failed:", err);
+			});
 		}
+
+		await clearTranscriptionProgress(videoId);
 
 		return { success: true, message: "Transcription completed successfully" };
 	} catch (error) {

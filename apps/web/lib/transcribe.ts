@@ -123,8 +123,40 @@ export async function transcribeVideo(
 			videoId,
 			userId,
 			aiGenerationEnabled,
-		}).catch((err) => {
+		}).catch(async (err) => {
 			console.error(`[transcribeVideo] Workflow failed for ${videoId}:`, err);
+
+			const errorMessage =
+				err instanceof Error
+					? err.message
+					: "Transcription failed unexpectedly";
+
+			try {
+				const [currentVideo] = await db()
+					.select({ metadata: videos.metadata })
+					.from(videos)
+					.where(eq(videos.id, videoId));
+
+				const currentMetadata = (currentVideo?.metadata as VideoMetadata) || {};
+
+				await db()
+					.update(videos)
+					.set({
+						transcriptionStatus: "ERROR",
+						metadata: {
+							...currentMetadata,
+							transcriptionProgress: undefined,
+							transcriptionProgressStartedAt: undefined,
+							transcriptionError: errorMessage,
+						},
+					})
+					.where(eq(videos.id, videoId));
+			} catch (dbErr) {
+				console.error(
+					`[transcribeVideo] Failed to save error status for ${videoId}:`,
+					dbErr,
+				);
+			}
 		});
 
 		return {

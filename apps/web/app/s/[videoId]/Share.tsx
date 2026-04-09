@@ -38,7 +38,7 @@ export type CommentType = typeof commentsSchema.$inferSelect & {
 };
 
 const SESSION_STORAGE_KEY = "cap_tb_session_id";
-const SESSION_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const SESSION_TTL_MS = 30 * 60 * 1000;
 
 const ensureAnalyticsSessionId = () => {
 	if (typeof window === "undefined") return "anonymous";
@@ -139,6 +139,8 @@ type AiGenerationStatus =
 	| "COMPLETE"
 	| "ERROR"
 	| "SKIPPED";
+
+type TranscriptionProgress = "EXTRACTING" | "TRANSCRIBING" | "SUMMARIZING";
 
 interface ShareProps {
 	data: VideoData;
@@ -286,6 +288,24 @@ export const Share = ({
 
 	const transcriptionStatus =
 		videoStatus?.transcriptionStatus || data.transcriptionStatus;
+
+	const transcriptionProgress: TranscriptionProgress | null =
+		videoStatus?.transcriptionProgress ??
+		(data.metadata as { transcriptionProgress?: TranscriptionProgress } | null)
+			?.transcriptionProgress ??
+		null;
+
+	const transcriptionError: string | null =
+		videoStatus?.transcriptionError ??
+		(data.metadata as { transcriptionError?: string } | null)
+			?.transcriptionError ??
+		null;
+
+	const transcriptionProgressStartedAt: string | null =
+		videoStatus?.transcriptionProgressStartedAt ??
+		(data.metadata as { transcriptionProgressStartedAt?: string } | null)
+			?.transcriptionProgressStartedAt ??
+		null;
 
 	const aiData = useMemo(
 		() => ({
@@ -513,6 +533,9 @@ export const Share = ({
 								aiData={aiData}
 								aiGenerationEnabled={aiGenerationEnabled}
 								ref={activityRef}
+								transcriptionProgress={transcriptionProgress}
+								transcriptionError={transcriptionError}
+								transcriptionProgressStartedAt={transcriptionProgressStartedAt}
 							/>
 						</div>
 					)}
