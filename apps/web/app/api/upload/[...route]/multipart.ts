@@ -23,7 +23,6 @@ import { z } from "zod";
 import { withAuth } from "@/app/api/utils";
 import { runPromise } from "@/lib/server";
 import { transcribeVideo } from "@/lib/transcribe";
-import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { stringOrNumberOptional } from "@/utils/zod";
 import {
 	getMultipartFileKey,
@@ -285,7 +284,8 @@ app.post(
 			const policy = yield* VideosPolicy;
 			const db = yield* Database;
 
-			const subpath = getSubpath(body) ?? "result.mp4";
+			const subpathFromFileKey = fileKey.split("/").slice(2).join("/");
+			const subpath = getSubpath(body) ?? subpathFromFileKey ?? "result.mp4";
 
 			if (!videoIdRaw) return c.text("Video id not found", 400);
 			const videoId = Video.VideoId.make(videoIdRaw);
@@ -379,51 +379,53 @@ app.post(
 
 					if (isRawRecorderUpload(subpath)) {
 						yield* db.use((db) =>
-							db
-								.update(Db.videos)
-								.set({
-									duration: updateIfDefined(
-										body.durationInSecs,
-										Db.videos.duration,
-									),
-									width: updateIfDefined(body.width, Db.videos.width),
-									height: updateIfDefined(body.height, Db.videos.height),
-									fps: updateIfDefined(body.fps, Db.videos.fps),
-								})
-								.where(
-									and(
-										eq(Db.videos.id, Video.VideoId.make(videoId)),
-										eq(Db.videos.ownerId, user.id),
-									),
-								),
+							db.transaction(async (tx) => {
+								await tx
+									.update(Db.videos)
+									.set({
+										duration: updateIfDefined(
+											body.durationInSecs,
+											Db.videos.duration,
+										),
+										width: updateIfDefined(body.width, Db.videos.width),
+										height: updateIfDefined(body.height, Db.videos.height),
+										fps: updateIfDefined(body.fps, Db.videos.fps),
+									})
+									.where(
+										and(
+											eq(Db.videos.id, Video.VideoId.make(videoId)),
+											eq(Db.videos.ownerId, user.id),
+										),
+									);
+								await tx
+									.insert(Db.videoUploads)
+									.values({
+										videoId: Video.VideoId.make(videoId),
+										phase: "complete",
+										rawFileKey: fileKey,
+										processingProgress: 100,
+										processingError: null,
+										processingMessage: null,
+									})
+									.onDuplicateKeyUpdate({
+										set: {
+											phase: "complete",
+											rawFileKey: fileKey,
+											processingProgress: 100,
+											processingError: null,
+											processingMessage: null,
+											updatedAt: new Date(),
+										},
+									});
+							}),
 						);
 
-						const processingStarted = yield* Effect.tryPromise(() =>
-							startVideoProcessingWorkflow({
-								videoId: Video.VideoId.make(videoId),
-								userId: user.id,
-								rawFileKey: fileKey,
-								bucketId: Option.getOrNull(video.bucketId),
-								processingMessage: "Starting video processing...",
-								startFailureMessage:
-									"Video uploaded, but processing could not start.",
-								mode: "multipart",
-							}),
-						).pipe(
-							Effect.map(() => true),
-							Effect.catchAll((error) =>
-								Effect.logError(
-									"Failed to start video processing workflow after raw upload completion",
-									error,
-								).pipe(Effect.map(() => false)),
-							),
-						);
+						uploadSucceeded = true;
 
 						return c.json({
 							location: result.Location,
 							success: true,
 							fileKey,
-							processingStarted,
 						});
 					}
 
@@ -453,32 +455,30 @@ app.post(
 						);
 
 					yield* db.use((db) =>
-						db.transaction(() =>
-							Promise.all([
-								db
-									.update(Db.videos)
-									.set({
-										duration: updateIfDefined(
-											body.durationInSecs,
-											Db.videos.duration,
-										),
-										width: updateIfDefined(body.width, Db.videos.width),
-										height: updateIfDefined(body.height, Db.videos.height),
-										fps: updateIfDefined(body.fps, Db.videos.fps),
-									})
-									.where(
-										and(
-											eq(Db.videos.id, Video.VideoId.make(videoId)),
-											eq(Db.videos.ownerId, user.id),
-										),
+						db.transaction(async (tx) => {
+							await tx
+								.update(Db.videos)
+								.set({
+									duration: updateIfDefined(
+										body.durationInSecs,
+										Db.videos.duration,
 									),
-								db
-									.delete(Db.videoUploads)
-									.where(
-										eq(Db.videoUploads.videoId, Video.VideoId.make(videoId)),
+									width: updateIfDefined(body.width, Db.videos.width),
+									height: updateIfDefined(body.height, Db.videos.height),
+									fps: updateIfDefined(body.fps, Db.videos.fps),
+								})
+								.where(
+									and(
+										eq(Db.videos.id, Video.VideoId.make(videoId)),
+										eq(Db.videos.ownerId, user.id),
 									),
-							]),
-						),
+								);
+							await tx
+								.delete(Db.videoUploads)
+								.where(
+									eq(Db.videoUploads.videoId, Video.VideoId.make(videoId)),
+								);
+						}),
 					);
 
 					const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
