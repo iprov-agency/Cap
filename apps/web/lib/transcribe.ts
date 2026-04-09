@@ -11,7 +11,39 @@ type TranscribeResult = {
 	message: string;
 };
 
-const PROCESSING_TIMEOUT_MS = 2 * 60 * 1000;
+const PROCESSING_TIMEOUT_MS = 5 * 60 * 1000;
+
+async function markTranscriptionError(
+	videoId: Video.VideoId,
+	errorMessage: string,
+): Promise<void> {
+	try {
+		const [currentVideo] = await db()
+			.select({ metadata: videos.metadata })
+			.from(videos)
+			.where(eq(videos.id, videoId));
+
+		const currentMetadata = (currentVideo?.metadata as VideoMetadata) || {};
+
+		await db()
+			.update(videos)
+			.set({
+				transcriptionStatus: "ERROR",
+				metadata: {
+					...currentMetadata,
+					transcriptionProgress: undefined,
+					transcriptionProgressStartedAt: undefined,
+					transcriptionError: errorMessage,
+				},
+			})
+			.where(eq(videos.id, videoId));
+	} catch (dbErr) {
+		console.error(
+			`[transcribeVideo] Failed to save error status for ${videoId}:`,
+			dbErr,
+		);
+	}
+}
 
 export async function transcribeVideo(
 	videoId: Video.VideoId,
@@ -98,20 +130,33 @@ export async function transcribeVideo(
 
 	if (video.transcriptionStatus === "PROCESSING") {
 		const metadata = (video.metadata ?? {}) as VideoMetadata;
-		const startedAt = metadata.transcriptionStartedAt;
-		if (startedAt && Date.now() - startedAt < PROCESSING_TIMEOUT_MS) {
+		const rawStartedAt = metadata.transcriptionStartedAt;
+		const startedAtMs =
+			typeof rawStartedAt === "string"
+				? Date.parse(rawStartedAt)
+				: rawStartedAt;
+		if (
+			startedAtMs == null ||
+			Number.isNaN(startedAtMs) ||
+			Date.now() - startedAtMs < PROCESSING_TIMEOUT_MS
+		) {
 			return {
 				success: true,
 				message: "Transcription already in progress",
 			};
 		}
 		console.log(
-			`[transcribeVideo] PROCESSING status stale for ${videoId}, resetting`,
+			`[transcribeVideo] PROCESSING status stale for ${videoId}, marking as ERROR`,
 		);
-		await db()
-			.update(videos)
-			.set({ transcriptionStatus: null })
-			.where(eq(videos.id, videoId));
+		await markTranscriptionError(
+			videoId,
+			"Transcription timed out after 5 minutes. Click retry to try again.",
+		);
+		return {
+			success: false,
+			message:
+				"Transcription timed out after 5 minutes. Click retry to try again.",
+		};
 	}
 
 	try {
@@ -131,32 +176,7 @@ export async function transcribeVideo(
 					? err.message
 					: "Transcription failed unexpectedly";
 
-			try {
-				const [currentVideo] = await db()
-					.select({ metadata: videos.metadata })
-					.from(videos)
-					.where(eq(videos.id, videoId));
-
-				const currentMetadata = (currentVideo?.metadata as VideoMetadata) || {};
-
-				await db()
-					.update(videos)
-					.set({
-						transcriptionStatus: "ERROR",
-						metadata: {
-							...currentMetadata,
-							transcriptionProgress: undefined,
-							transcriptionProgressStartedAt: undefined,
-							transcriptionError: errorMessage,
-						},
-					})
-					.where(eq(videos.id, videoId));
-			} catch (dbErr) {
-				console.error(
-					`[transcribeVideo] Failed to save error status for ${videoId}:`,
-					dbErr,
-				);
-			}
+			await markTranscriptionError(videoId, errorMessage);
 		});
 
 		return {
@@ -166,10 +186,12 @@ export async function transcribeVideo(
 	} catch (error) {
 		console.error("[transcribeVideo] Failed to trigger workflow:", error);
 
-		await db()
-			.update(videos)
-			.set({ transcriptionStatus: null })
-			.where(eq(videos.id, videoId));
+		const errorMessage =
+			error instanceof Error
+				? error.message
+				: "Failed to start transcription workflow";
+
+		await markTranscriptionError(videoId, errorMessage);
 
 		return {
 			success: false,
