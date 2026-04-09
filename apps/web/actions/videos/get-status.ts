@@ -79,6 +79,8 @@ const PHASE_STALE_TIMEOUTS: Record<string, number> = {
 
 const DEFAULT_STALE_TIMEOUT_MS = 5 * 60 * 1000;
 
+const AI_GENERATION_CLAIM_TTL_MS = 10 * 60 * 1000;
+
 const getAffectedRows = (result: unknown) => {
 	if (Array.isArray(result)) {
 		return (
@@ -89,23 +91,14 @@ const getAffectedRows = (result: unknown) => {
 };
 
 function buildStatusResponse(
-	transcriptionStatus: string | null,
+	transcriptionStatus: TranscriptionStatus | null,
+	aiGenerationStatus: AiGenerationStatus | null,
 	metadata: VideoMetadata,
 	overrides?: Partial<VideoStatusResult>,
 ): VideoStatusResult {
-	const validatedTranscription = isValidTranscriptionStatus(transcriptionStatus)
-		? transcriptionStatus
-		: null;
-
-	const validatedAiGeneration = isValidAiGenerationStatus(
-		metadata.aiGenerationStatus,
-	)
-		? metadata.aiGenerationStatus
-		: null;
-
 	return {
-		transcriptionStatus: validatedTranscription,
-		aiGenerationStatus: validatedAiGeneration,
+		transcriptionStatus,
+		aiGenerationStatus,
 		aiTitle: metadata.aiTitle || null,
 		summary: metadata.summary || null,
 		chapters: metadata.chapters || null,
@@ -178,6 +171,7 @@ async function checkActiveUploads(
 function triggerTranscription(
 	videoId: Video.VideoId,
 	ownerId: string,
+	normalizedAiGenerationStatus: AiGenerationStatus | null,
 	metadata: VideoMetadata,
 ): VideoStatusResult {
 	console.log(
@@ -191,29 +185,40 @@ function triggerTranscription(
 			);
 		});
 
-		return buildStatusResponse("PROCESSING", metadata, {
-			transcriptionError: null,
-			transcriptionProgress: null,
-			transcriptionProgressStartedAt: null,
-		});
+		return buildStatusResponse(
+			"PROCESSING",
+			normalizedAiGenerationStatus,
+			metadata,
+			{
+				transcriptionError: null,
+				transcriptionProgress: null,
+				transcriptionProgressStartedAt: null,
+			},
+		);
 	} catch (error) {
 		console.error(
 			`[Get Status] Error triggering transcription for video ${videoId}:`,
 			error,
 		);
-		return buildStatusResponse("ERROR", metadata, {
-			error: "Failed to start transcription",
-			transcriptionProgress: null,
-			transcriptionError: "Failed to start transcription",
-			transcriptionProgressStartedAt: null,
-		});
+		return buildStatusResponse(
+			"ERROR",
+			normalizedAiGenerationStatus,
+			metadata,
+			{
+				error: "Failed to start transcription",
+				transcriptionProgress: null,
+				transcriptionError: "Failed to start transcription",
+				transcriptionProgressStartedAt: null,
+			},
+		);
 	}
 }
 
 async function triggerAiGenerationIfEligible(
 	videoId: Video.VideoId,
 	ownerId: string,
-	transcriptionStatus: string | null,
+	normalizedTranscriptionStatus: TranscriptionStatus | null,
+	normalizedAiGenerationStatus: AiGenerationStatus | null,
 	metadata: VideoMetadata,
 ): Promise<VideoStatusResult | null> {
 	try {
@@ -229,22 +234,38 @@ async function triggerAiGenerationIfEligible(
 
 		const owner = ownerQuery[0];
 		if (owner && (await isAiGenerationEnabled(owner))) {
+			const staleClaimThreshold = Date.now() - AI_GENERATION_CLAIM_TTL_MS;
 			const claimResult = await db()
 				.update(videos)
 				.set({
-					metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', 'PROCESSING')`,
+					metadata: sql`JSON_SET(
+						COALESCE(metadata, '{}'),
+						'$.aiGenerationStatus', 'PROCESSING',
+						'$.aiGenerationClaimedAt', ${Date.now()}
+					)`,
 				})
 				.where(
 					and(
 						eq(videos.id, videoId),
-						sql`(JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) NOT IN ('PROCESSING', 'QUEUED'))`,
+						sql`(
+							JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) IS NULL
+							OR (
+								JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) = 'PROCESSING'
+								AND CAST(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationClaimedAt') AS UNSIGNED) < ${staleClaimThreshold}
+							)
+						)`,
 					),
 				);
 
 			if (getAffectedRows(claimResult) === 0) {
-				return buildStatusResponse(transcriptionStatus, metadata, {
-					transcriptionError: null,
-				});
+				return buildStatusResponse(
+					normalizedTranscriptionStatus,
+					normalizedAiGenerationStatus,
+					metadata,
+					{
+						transcriptionError: null,
+					},
+				);
 			}
 
 			console.log(
@@ -258,16 +279,20 @@ async function triggerAiGenerationIfEligible(
 				await db()
 					.update(videos)
 					.set({
-						metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', CAST(NULL AS JSON))`,
+						metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', CAST(NULL AS JSON), '$.aiGenerationClaimedAt', CAST(NULL AS JSON))`,
 					})
 					.where(eq(videos.id, videoId))
 					.catch(() => {});
 			});
 
-			return buildStatusResponse(transcriptionStatus, metadata, {
-				aiGenerationStatus: "PROCESSING" as AiGenerationStatus,
-				transcriptionError: null,
-			});
+			return buildStatusResponse(
+				normalizedTranscriptionStatus,
+				"PROCESSING" as AiGenerationStatus,
+				metadata,
+				{
+					transcriptionError: null,
+				},
+			);
 		}
 	} catch (error) {
 		console.error(
@@ -299,32 +324,54 @@ export async function getVideoStatus(
 
 	const metadata: VideoMetadata = (video.metadata as VideoMetadata) || {};
 
-	if (!video.transcriptionStatus && serverEnv().GOOGLE_API_KEY) {
+	const normalizedTranscriptionStatus = isValidTranscriptionStatus(
+		video.transcriptionStatus,
+	)
+		? (video.transcriptionStatus as TranscriptionStatus)
+		: null;
+
+	const normalizedAiGenerationStatus = isValidAiGenerationStatus(
+		metadata.aiGenerationStatus,
+	)
+		? (metadata.aiGenerationStatus as AiGenerationStatus)
+		: null;
+
+	if (!normalizedTranscriptionStatus && serverEnv().GOOGLE_API_KEY) {
 		const uploadStatus = await checkActiveUploads(videoId);
 
 		if (uploadStatus === "active") {
-			return buildStatusResponse(null, metadata, {
+			return buildStatusResponse(null, normalizedAiGenerationStatus, metadata, {
 				transcriptionProgress: null,
 				transcriptionError: null,
 				transcriptionProgressStartedAt: null,
 			});
 		}
 
-		return triggerTranscription(videoId, video.ownerId, metadata);
+		return triggerTranscription(
+			videoId,
+			video.ownerId,
+			normalizedAiGenerationStatus,
+			metadata,
+		);
 	}
 
-	if (video.transcriptionStatus === "ERROR") {
-		return buildStatusResponse("ERROR", metadata, {
-			error: metadata.transcriptionError || "Transcription failed",
-			transcriptionProgress: null,
-			transcriptionError: metadata.transcriptionError ?? null,
-			transcriptionProgressStartedAt: null,
-		});
+	if (normalizedTranscriptionStatus === "ERROR") {
+		return buildStatusResponse(
+			"ERROR",
+			normalizedAiGenerationStatus,
+			metadata,
+			{
+				error: metadata.transcriptionError || "Transcription failed",
+				transcriptionProgress: null,
+				transcriptionError: metadata.transcriptionError ?? null,
+				transcriptionProgressStartedAt: null,
+			},
+		);
 	}
 
 	const shouldTriggerAiGeneration =
-		video.transcriptionStatus === "COMPLETE" &&
-		!metadata.aiGenerationStatus &&
+		normalizedTranscriptionStatus === "COMPLETE" &&
+		!normalizedAiGenerationStatus &&
 		!metadata.summary &&
 		(serverEnv().GROQ_API_KEY || serverEnv().OPENAI_API_KEY);
 
@@ -332,11 +379,16 @@ export async function getVideoStatus(
 		const aiResult = await triggerAiGenerationIfEligible(
 			videoId,
 			video.ownerId,
-			video.transcriptionStatus,
+			normalizedTranscriptionStatus,
+			normalizedAiGenerationStatus,
 			metadata,
 		);
 		if (aiResult) return aiResult;
 	}
 
-	return buildStatusResponse(video.transcriptionStatus, metadata);
+	return buildStatusResponse(
+		normalizedTranscriptionStatus,
+		normalizedAiGenerationStatus,
+		metadata,
+	);
 }

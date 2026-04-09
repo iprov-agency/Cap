@@ -10,6 +10,7 @@ export interface VideoMetadata {
 		| "COMPLETE"
 		| "ERROR"
 		| "SKIPPED";
+	aiGenerationClaimedAt?: number;
 	enhancedAudioStatus?: "PROCESSING" | "COMPLETE" | "ERROR" | "SKIPPED";
 	transcriptionStartedAt?: number;
 	transcriptionProgress?: "EXTRACTING" | "TRANSCRIBING" | "SUMMARIZING";

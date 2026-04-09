@@ -2,7 +2,6 @@
 created: 2026-04-09
 system: cap
 status: approved
-content_hash: cad77a8e248c5629b18b76df71f871cfd68b8d461017894a87d164a3bf8f5235
 target_agent: worktree
 acceptance_criteria:
   - "Do all helper functions wrap DB operations in try/catch with graceful degradation?"
@@ -22,9 +21,15 @@ repos:
 
 Four pre-existing quality issues in `apps/web/actions/videos/get-status.ts` were surfaced by Codex during the sentrux refactor. The file was refactored in PR #8 to extract helper functions (`checkActiveUploads`, `triggerTranscription`, `triggerAiGenerationIfEligible`, `buildStatusResponse`), but these helpers lack error handling and validation. Transient DB errors in `checkActiveUploads` abort the entire request, corrupted transcription status values leak to clients, stale error metadata persists across transcription restarts, and concurrent polls can trigger duplicate AI generation jobs. Additionally, the AI generation metadata write uses a read-then-write spread pattern that can clobber concurrent metadata updates, and `startAiGeneration` failures leave the status stuck at PROCESSING with no rollback.
 
+Two additional high-severity issues were found during post-build review:
+
+**Stranded PROCESSING claim (AI-STRAND-004):** The claim update sets `aiGenerationStatus` to PROCESSING via `JSON_SET` before `startAiGeneration` runs. If the process crashes between the DB update and the `startAiGeneration` call, the `.catch()` rollback never fires, and the status stays PROCESSING forever. The guard then blocks future retries. Fix: record an `aiGenerationClaimedAt` timestamp alongside the PROCESSING status. Before claiming, check if an existing PROCESSING claim is stale (older than 10 minutes). If stale, allow re-claim.
+
+**Normalized status masking corruption (STATUS-NORM-005):** `buildStatusResponse` normalizes invalid statuses to null, but `getVideoStatus` still branches on raw DB values (`video.transcriptionStatus`, `metadata.aiGenerationStatus`). If the DB has a corrupted status, the client sees null forever while the server refuses to re-trigger because the raw value is truthy. Fix: normalize statuses once at the top of `getVideoStatus`, then use normalized values for all subsequent logic.
+
 ## Design
 
-All fixes are contained within a single file (`apps/web/actions/videos/get-status.ts`). No schema changes, no new files, no new dependencies.
+Fixes span two files: `apps/web/actions/videos/get-status.ts` (logic) and `packages/database/types/metadata.ts` (type addition).
 
 ### Bug 1: DB error handling in helpers
 
@@ -42,19 +47,63 @@ Add a `VALID_TRANSCRIPTION_STATUSES` constant and a type guard `isValidTranscrip
 
 Add a `VALID_AI_GENERATION_STATUSES` constant and a type guard `isValidAiGenerationStatus`. Use it in `buildStatusResponse` to validate the `aiGenerationStatus` from metadata before including it in the response. If the value is not a known status, treat it as `null`.
 
+**Status normalization (CRITICAL):** Normalize statuses ONCE at the top of `getVideoStatus`, immediately after reading the video and metadata. The exact normalization code is:
+
+```typescript
+const normalizedTranscriptionStatus = isValidTranscriptionStatus(
+    video.transcriptionStatus,
+)
+    ? (video.transcriptionStatus as TranscriptionStatus)
+    : null;
+
+const normalizedAiGenerationStatus = isValidAiGenerationStatus(
+    metadata.aiGenerationStatus,
+)
+    ? (metadata.aiGenerationStatus as AiGenerationStatus)
+    : null;
+```
+
+After this point, ALL subsequent code MUST use `normalizedTranscriptionStatus` and `normalizedAiGenerationStatus`. Zero references to `video.transcriptionStatus` or `metadata.aiGenerationStatus` may appear after the normalization point. Specifically:
+
+1. The transcription trigger check uses `!normalizedTranscriptionStatus` (not `!video.transcriptionStatus`).
+2. The ERROR branch checks `normalizedTranscriptionStatus === "ERROR"` (not `video.transcriptionStatus === "ERROR"`).
+3. The `shouldTriggerAiGeneration` check compares `normalizedTranscriptionStatus === "COMPLETE"` and `!normalizedAiGenerationStatus` (not raw values).
+4. `buildStatusResponse` receives `normalizedTranscriptionStatus` and `normalizedAiGenerationStatus` as typed parameters (signature: `TranscriptionStatus | null` and `AiGenerationStatus | null`), not raw strings.
+5. `triggerTranscription` and `triggerAiGenerationIfEligible` receive normalized values as parameters.
+6. The final return passes `normalizedTranscriptionStatus` and `normalizedAiGenerationStatus` to `buildStatusResponse`.
+
 ### Bug 3: Stale metadata on transcription restart
 
 When `triggerTranscription` returns a PROCESSING status, override `transcriptionError`, `transcriptionProgress`, and `transcriptionProgressStartedAt` to `null` via the overrides parameter of `buildStatusResponse`. This prevents stale failure data from a previous attempt from showing alongside the new PROCESSING status.
 
-### Bug 4: AI generation race condition, metadata clobber, and failure rollback
+### Bug 4: AI generation race condition, metadata clobber, failure rollback, and stale claim recovery
 
-Three related problems in `triggerAiGenerationIfEligible`:
+Four related problems in `triggerAiGenerationIfEligible`:
 
-**Race condition (AI-RACE-001):** The previous spec used a read-then-write pattern: read metadata, check if PROCESSING/QUEUED, then write PROCESSING. Two concurrent requests can both read null and both trigger `startAiGeneration`. Fix: use a single atomic SQL UPDATE with `JSON_SET` and a WHERE clause that only matches if `aiGenerationStatus` is NOT already PROCESSING or QUEUED. Check `affectedRows` on the result: if zero rows were affected, another request already claimed the lock, so skip `startAiGeneration`.
+**Race condition (AI-RACE-001):** The previous spec used a read-then-write pattern: read metadata, check if PROCESSING/QUEUED, then write PROCESSING. Two concurrent requests can both read null and both trigger `startAiGeneration`. Fix: use a single atomic SQL UPDATE with `JSON_SET` and a WHERE clause that only succeeds when the claim is safe to make. Check `affectedRows` on the result: if zero rows were affected, another request already claimed the lock, so skip `startAiGeneration`.
 
 **Metadata clobber (AI-META-002):** The previous spec used `{...metadata, aiGenerationStatus: "PROCESSING"}` which reads the full metadata object, spreads it, and writes back. Any concurrent metadata updates between the read and write get overwritten. Fix: use SQL `JSON_SET` to atomically update only the `aiGenerationStatus` field without touching other metadata fields. This is the same `JSON_SET` used for the race fix above.
 
 **Stuck PROCESSING on failure (AI-STUCK-003):** If `startAiGeneration` throws, `aiGenerationStatus` stays PROCESSING permanently. Fix: in the `.catch()` handler for `startAiGeneration`, reset `aiGenerationStatus` to null using `JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', CAST(NULL AS JSON))`. This allows a future poll to retry.
+
+**Stranded claim recovery (AI-STRAND-004):** If the process crashes between the atomic DB update and the `startAiGeneration` call, the `.catch()` never fires and the status stays PROCESSING forever. Fix: the `JSON_SET` claim now also writes `$.aiGenerationClaimedAt` with `Date.now()`. The WHERE clause adds an OR branch that allows re-claim when the existing PROCESSING claim is older than `AI_GENERATION_CLAIM_TTL_MS` (10 minutes). The `.catch()` rollback also clears `aiGenerationClaimedAt` alongside `aiGenerationStatus`. A new `aiGenerationClaimedAt` field is added to the `VideoMetadata` type.
+
+**WHERE clause semantics (CRITICAL):** The atomic claim WHERE clause must ONLY allow the update to succeed in two cases:
+
+1. `aiGenerationStatus` IS NULL (generation was never started).
+2. `aiGenerationStatus` is PROCESSING AND `aiGenerationClaimedAt` is older than `AI_GENERATION_CLAIM_TTL_MS` (crashed worker recovery).
+
+The claim MUST NOT succeed when `aiGenerationStatus` is COMPLETE, ERROR, QUEUED, or SKIPPED. A previous revision used `NOT IN ('PROCESSING', 'QUEUED')` which incorrectly allowed the claim to succeed on COMPLETE and ERROR, overwriting a finished generation. The corrected SQL condition is:
+
+```sql
+(
+    JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) IS NULL
+    OR (
+        JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) = 'PROCESSING'
+        AND CAST(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationClaimedAt') AS UNSIGNED) < ${staleClaimThreshold}
+    )
+)
+```
 
 ## Acceptance Criteria
 
@@ -64,6 +113,38 @@ Three related problems in `triggerAiGenerationIfEligible`:
 - [ ] Does triggerAiGenerationIfEligible check for existing PROCESSING status before triggering?
 
 ## Implementation
+
+### `packages/database/types/metadata.ts`
+
+```typescript
+export interface VideoMetadata {
+	customCreatedAt?: string;
+	sourceName?: string;
+	aiTitle?: string;
+	summary?: string;
+	chapters?: { title: string; start: number }[];
+	aiGenerationStatus?:
+		| "QUEUED"
+		| "PROCESSING"
+		| "COMPLETE"
+		| "ERROR"
+		| "SKIPPED";
+	aiGenerationClaimedAt?: number;
+	enhancedAudioStatus?: "PROCESSING" | "COMPLETE" | "ERROR" | "SKIPPED";
+	transcriptionStartedAt?: number;
+	transcriptionProgress?: "EXTRACTING" | "TRANSCRIBING" | "SUMMARIZING";
+	transcriptionError?: string;
+	transcriptionProgressStartedAt?: string;
+}
+
+export interface SpaceMetadata {
+	[key: string]: never;
+}
+
+export interface UserMetadata {
+	[key: string]: never;
+}
+```
 
 ### `apps/web/actions/videos/get-status.ts`
 
@@ -149,6 +230,8 @@ const PHASE_STALE_TIMEOUTS: Record<string, number> = {
 
 const DEFAULT_STALE_TIMEOUT_MS = 5 * 60 * 1000;
 
+const AI_GENERATION_CLAIM_TTL_MS = 10 * 60 * 1000;
+
 const getAffectedRows = (result: unknown) => {
 	if (Array.isArray(result)) {
 		return (
@@ -159,25 +242,14 @@ const getAffectedRows = (result: unknown) => {
 };
 
 function buildStatusResponse(
-	transcriptionStatus: string | null,
+	transcriptionStatus: TranscriptionStatus | null,
+	aiGenerationStatus: AiGenerationStatus | null,
 	metadata: VideoMetadata,
 	overrides?: Partial<VideoStatusResult>,
 ): VideoStatusResult {
-	const validatedTranscription = isValidTranscriptionStatus(
-		transcriptionStatus,
-	)
-		? transcriptionStatus
-		: null;
-
-	const validatedAiGeneration = isValidAiGenerationStatus(
-		metadata.aiGenerationStatus,
-	)
-		? metadata.aiGenerationStatus
-		: null;
-
 	return {
-		transcriptionStatus: validatedTranscription,
-		aiGenerationStatus: validatedAiGeneration,
+		transcriptionStatus,
+		aiGenerationStatus,
 		aiTitle: metadata.aiTitle || null,
 		summary: metadata.summary || null,
 		chapters: metadata.chapters || null,
@@ -250,6 +322,7 @@ async function checkActiveUploads(
 function triggerTranscription(
 	videoId: Video.VideoId,
 	ownerId: string,
+	normalizedAiGenerationStatus: AiGenerationStatus | null,
 	metadata: VideoMetadata,
 ): VideoStatusResult {
 	console.log(
@@ -263,29 +336,40 @@ function triggerTranscription(
 			);
 		});
 
-		return buildStatusResponse("PROCESSING", metadata, {
-			transcriptionError: null,
-			transcriptionProgress: null,
-			transcriptionProgressStartedAt: null,
-		});
+		return buildStatusResponse(
+			"PROCESSING",
+			normalizedAiGenerationStatus,
+			metadata,
+			{
+				transcriptionError: null,
+				transcriptionProgress: null,
+				transcriptionProgressStartedAt: null,
+			},
+		);
 	} catch (error) {
 		console.error(
 			`[Get Status] Error triggering transcription for video ${videoId}:`,
 			error,
 		);
-		return buildStatusResponse("ERROR", metadata, {
-			error: "Failed to start transcription",
-			transcriptionProgress: null,
-			transcriptionError: "Failed to start transcription",
-			transcriptionProgressStartedAt: null,
-		});
+		return buildStatusResponse(
+			"ERROR",
+			normalizedAiGenerationStatus,
+			metadata,
+			{
+				error: "Failed to start transcription",
+				transcriptionProgress: null,
+				transcriptionError: "Failed to start transcription",
+				transcriptionProgressStartedAt: null,
+			},
+		);
 	}
 }
 
 async function triggerAiGenerationIfEligible(
 	videoId: Video.VideoId,
 	ownerId: string,
-	transcriptionStatus: string | null,
+	normalizedTranscriptionStatus: TranscriptionStatus | null,
+	normalizedAiGenerationStatus: AiGenerationStatus | null,
 	metadata: VideoMetadata,
 ): Promise<VideoStatusResult | null> {
 	try {
@@ -301,22 +385,38 @@ async function triggerAiGenerationIfEligible(
 
 		const owner = ownerQuery[0];
 		if (owner && (await isAiGenerationEnabled(owner))) {
+			const staleClaimThreshold = Date.now() - AI_GENERATION_CLAIM_TTL_MS;
 			const claimResult = await db()
 				.update(videos)
 				.set({
-					metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', 'PROCESSING')`,
+					metadata: sql`JSON_SET(
+						COALESCE(metadata, '{}'),
+						'$.aiGenerationStatus', 'PROCESSING',
+						'$.aiGenerationClaimedAt', ${Date.now()}
+					)`,
 				})
 				.where(
 					and(
 						eq(videos.id, videoId),
-						sql`(JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) NOT IN ('PROCESSING', 'QUEUED'))`,
+						sql`(
+							JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) IS NULL
+							OR (
+								JSON_UNQUOTE(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationStatus')) = 'PROCESSING'
+								AND CAST(JSON_EXTRACT(COALESCE(metadata, '{}'), '$.aiGenerationClaimedAt') AS UNSIGNED) < ${staleClaimThreshold}
+							)
+						)`,
 					),
 				);
 
 			if (getAffectedRows(claimResult) === 0) {
-				return buildStatusResponse(transcriptionStatus, metadata, {
-					transcriptionError: null,
-				});
+				return buildStatusResponse(
+					normalizedTranscriptionStatus,
+					normalizedAiGenerationStatus,
+					metadata,
+					{
+						transcriptionError: null,
+					},
+				);
 			}
 
 			console.log(
@@ -330,16 +430,20 @@ async function triggerAiGenerationIfEligible(
 				await db()
 					.update(videos)
 					.set({
-						metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', CAST(NULL AS JSON))`,
+						metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', CAST(NULL AS JSON), '$.aiGenerationClaimedAt', CAST(NULL AS JSON))`,
 					})
 					.where(eq(videos.id, videoId))
 					.catch(() => {});
 			});
 
-			return buildStatusResponse(transcriptionStatus, metadata, {
-				aiGenerationStatus: "PROCESSING" as AiGenerationStatus,
-				transcriptionError: null,
-			});
+			return buildStatusResponse(
+				normalizedTranscriptionStatus,
+				"PROCESSING" as AiGenerationStatus,
+				metadata,
+				{
+					transcriptionError: null,
+				},
+			);
 		}
 	} catch (error) {
 		console.error(
@@ -371,32 +475,54 @@ export async function getVideoStatus(
 
 	const metadata: VideoMetadata = (video.metadata as VideoMetadata) || {};
 
-	if (!video.transcriptionStatus && serverEnv().GOOGLE_API_KEY) {
+	const normalizedTranscriptionStatus = isValidTranscriptionStatus(
+		video.transcriptionStatus,
+	)
+		? (video.transcriptionStatus as TranscriptionStatus)
+		: null;
+
+	const normalizedAiGenerationStatus = isValidAiGenerationStatus(
+		metadata.aiGenerationStatus,
+	)
+		? (metadata.aiGenerationStatus as AiGenerationStatus)
+		: null;
+
+	if (!normalizedTranscriptionStatus && serverEnv().GOOGLE_API_KEY) {
 		const uploadStatus = await checkActiveUploads(videoId);
 
 		if (uploadStatus === "active") {
-			return buildStatusResponse(null, metadata, {
+			return buildStatusResponse(null, normalizedAiGenerationStatus, metadata, {
 				transcriptionProgress: null,
 				transcriptionError: null,
 				transcriptionProgressStartedAt: null,
 			});
 		}
 
-		return triggerTranscription(videoId, video.ownerId, metadata);
+		return triggerTranscription(
+			videoId,
+			video.ownerId,
+			normalizedAiGenerationStatus,
+			metadata,
+		);
 	}
 
-	if (video.transcriptionStatus === "ERROR") {
-		return buildStatusResponse("ERROR", metadata, {
-			error: metadata.transcriptionError || "Transcription failed",
-			transcriptionProgress: null,
-			transcriptionError: metadata.transcriptionError ?? null,
-			transcriptionProgressStartedAt: null,
-		});
+	if (normalizedTranscriptionStatus === "ERROR") {
+		return buildStatusResponse(
+			"ERROR",
+			normalizedAiGenerationStatus,
+			metadata,
+			{
+				error: metadata.transcriptionError || "Transcription failed",
+				transcriptionProgress: null,
+				transcriptionError: metadata.transcriptionError ?? null,
+				transcriptionProgressStartedAt: null,
+			},
+		);
 	}
 
 	const shouldTriggerAiGeneration =
-		video.transcriptionStatus === "COMPLETE" &&
-		!metadata.aiGenerationStatus &&
+		normalizedTranscriptionStatus === "COMPLETE" &&
+		!normalizedAiGenerationStatus &&
 		!metadata.summary &&
 		(serverEnv().GROQ_API_KEY || serverEnv().OPENAI_API_KEY);
 
@@ -404,13 +530,18 @@ export async function getVideoStatus(
 		const aiResult = await triggerAiGenerationIfEligible(
 			videoId,
 			video.ownerId,
-			video.transcriptionStatus,
+			normalizedTranscriptionStatus,
+			normalizedAiGenerationStatus,
 			metadata,
 		);
 		if (aiResult) return aiResult;
 	}
 
-	return buildStatusResponse(video.transcriptionStatus, metadata);
+	return buildStatusResponse(
+		normalizedTranscriptionStatus,
+		normalizedAiGenerationStatus,
+		metadata,
+	);
 }
 ```
 
@@ -419,11 +550,13 @@ export async function getVideoStatus(
 - The `startAiGeneration` function in `generate-ai.ts` also uses the read-then-write spread pattern (`{...metadata, aiGenerationStatus: "QUEUED"}`) when setting its own status. This is the same metadata clobber vulnerability (AI-META-002) but on the `generate-ai.ts` side. Fixing that file is out of scope for this spec since it would change the generate-ai module's contract, but it should be addressed in a follow-up.
 - The atomic claim write sets `aiGenerationStatus` to `"PROCESSING"`, then `startAiGeneration` overwrites it to `"QUEUED"` via its own DB write. Both values cause the guard to skip, and the brief PROCESSING-to-QUEUED transition is not user-visible. However, if a future change to `startAiGeneration` removes its own QUEUED write, the status would remain PROCESSING permanently. This coupling should be documented if it becomes a concern.
 - The `.catch()` rollback in `triggerAiGenerationIfEligible` resets `aiGenerationStatus` to null using `CAST(NULL AS JSON)`. This means a future poll could retry the generation. If `startAiGeneration` fails repeatedly, this creates a retry loop bounded only by the poll interval. Rate limiting or a retry counter could be added in a follow-up if this becomes a problem.
+- The stale claim recovery (AI-STRAND-004) uses a 10-minute TTL. If `startAiGeneration` legitimately takes longer than 10 minutes, a concurrent poll could re-claim and start a duplicate. In practice, AI generation should complete well within 10 minutes, so this threshold is conservative. If needed, it can be tuned or `startAiGeneration` can update `aiGenerationClaimedAt` as a heartbeat.
+- The `startAiGeneration` spread pattern in `generate-ai.ts` will overwrite `aiGenerationClaimedAt` when it sets `{...metadata, aiGenerationStatus: "QUEUED"}`. This means the claimed-at timestamp is lost once `startAiGeneration` runs. However, this is acceptable because if `startAiGeneration` already ran, the process did not crash between the claim and the call, so the stranded-claim scenario does not apply. The stale-claim check only matters when the process crashed before `startAiGeneration` could run at all.
 
 ## Key Files
 
-- `apps/web/actions/videos/get-status.ts` - Server action for video status polling. All four hardening fixes are in this file.
+- `apps/web/actions/videos/get-status.ts` - Server action for video status polling. All hardening fixes plus stale-claim recovery and status normalization are in this file.
+- `packages/database/types/metadata.ts` - Defines `VideoMetadata` interface. Added `aiGenerationClaimedAt` field.
 - `apps/web/lib/generate-ai.ts` - Called by `triggerAiGenerationIfEligible`. Has its own PROCESSING/QUEUED idempotency guard (defense-in-depth). Also uses the spread pattern for metadata writes (out of scope).
 - `apps/web/lib/video-processing.ts` - Contains the `getAffectedRows` helper pattern used as reference for the new helper in this file.
-- `packages/database/types/metadata.ts` - Defines `VideoMetadata` interface (unchanged).
 - `packages/database/schema.ts` - Defines `transcriptionStatus` enum on the videos table (unchanged).
