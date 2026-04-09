@@ -80,9 +80,7 @@ export const WebRecorderDialog = () => {
 			return;
 		}
 		audio.currentTime = 0;
-		void audio.play().catch(() => {
-			/* ignore */
-		});
+		void audio.play().catch(() => {});
 	}, []);
 
 	const handleRecordingStartSound = useCallback(() => {
@@ -212,6 +210,17 @@ export const WebRecorderDialog = () => {
 		}
 		setOpen(next);
 	};
+
+	useEffect(() => {
+		if (open && phase === "completed" && completedShareUrl) {
+			void resetState();
+			setSelectedCameraId(null);
+			setRecordingMode("fullscreen");
+			setSettingsOpen(false);
+			setHowItWorksOpen(false);
+			setOpen(false);
+		}
+	}, [open, phase, completedShareUrl, resetState, setSelectedCameraId]);
 
 	const handleStopClick = () => {
 		stopRecording().catch((err: unknown) => {
