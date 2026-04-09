@@ -1,6 +1,6 @@
 # Cap
 
-Generated: 2026-04-09 06:56 | Files: 1612 | Functions: 10225 | Relationships: 126729 | Languages: javascript, rust, tsx, typescript
+Generated: 2026-04-09 13:33 | Files: 1612 | Functions: 10225 | Relationships: 126729 | Languages: javascript, rust, tsx, typescript
 
 This file is auto-generated from the code-review-graph knowledge graph and the corrections database. Do not edit manually. It will be regenerated after each build cycle.
 
