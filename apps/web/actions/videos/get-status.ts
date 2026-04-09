@@ -6,7 +6,7 @@ import type { VideoMetadata } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import { provideOptionalAuth, VideosPolicy } from "@cap/web-backend";
 import { Policy, type Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { Effect, Exit } from "effect";
 import { startAiGeneration } from "@/lib/generate-ai";
 import * as EffectRuntime from "@/lib/server";
@@ -41,6 +41,14 @@ export interface VideoStatusResult {
 	transcriptionProgressStartedAt?: string | null;
 }
 
+const ACTIVE_UPLOAD_PHASES = [
+	"uploading",
+	"processing",
+	"generating_thumbnail",
+] as const;
+
+const UPLOAD_STALE_TIMEOUT_MS = 5 * 60 * 1000;
+
 export async function getVideoStatus(
 	videoId: Video.VideoId,
 ): Promise<VideoStatusResult | { success: false }> {
@@ -69,15 +77,20 @@ export async function getVideoStatus(
 				updatedAt: videoUploads.updatedAt,
 			})
 			.from(videoUploads)
-			.where(eq(videoUploads.videoId, videoId))
+			.where(
+				and(
+					eq(videoUploads.videoId, videoId),
+					inArray(videoUploads.phase, [...ACTIVE_UPLOAD_PHASES]),
+				),
+			)
 			.limit(1);
 
-		if (activeUpload.length > 0) {
-			const upload = activeUpload[0]!;
+		const upload = activeUpload[0];
+		if (upload) {
 			const ageMs = Date.now() - new Date(upload.updatedAt).getTime();
-			const isStale = ageMs > 5 * 60 * 1000;
+			const isStale = ageMs > UPLOAD_STALE_TIMEOUT_MS;
 
-			if (isStale && upload.phase === "uploading") {
+			if (isStale) {
 				console.log(
 					`[Get Status] Cleaning up stale upload record for video ${videoId} (phase: ${upload.phase}, age: ${Math.round(ageMs / 1000)}s)`,
 				);

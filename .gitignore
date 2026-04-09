@@ -70,4 +70,5 @@ scripts/releases-backfill-data.txt
 analysis/
 analysis/plans/
 .ralphy
-tmp/
+tmp/.pnpm-store/
+package-lock.json
