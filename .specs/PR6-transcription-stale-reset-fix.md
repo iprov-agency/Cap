@@ -2,7 +2,6 @@
 created: 2026-04-09
 system: cap
 status: approved
-content_hash: a1f340a38f86b58ec97d9cecbe85bde63a2bb2742cad409868ada3c3dcd32035
 target_agent: worktree
 acceptance_criteria:
   - "Is PROCESSING_TIMEOUT_MS set to 5 minutes (300000ms) instead of 2 minutes?"
@@ -19,7 +18,7 @@ repos:
 
 ## Problem
 
-Four bugs discovered by adversarial review of PRs #2-5 on main cause duplicate transcription workflows, blocked transcription triggers, and stalled processing records.
+Four bugs discovered by adversarial review of PRs #2-5 on main cause duplicate transcription workflows, blocked transcription triggers, and stalled processing records. Post-build review found two additional issues in the stale upload cleanup logic.
 
 Bug 1 (TSRF-001): In `apps/web/lib/transcribe.ts`, the stale PROCESSING check uses `Date.now() - startedAt` directly. The `transcriptionStartedAt` field is typed as `number` but could arrive as an ISO string or be missing at runtime. If it is a string, the subtraction yields NaN, which fails the comparison and causes the code to immediately fall through to resetting the status. If it is undefined, the guard passes but the behavior is fragile.
 
@@ -28,6 +27,10 @@ Bug 2 (TSRF-002): In `apps/web/lib/transcribe.ts`, the outer catch block (for sy
 Bug 3 (TSRF-003): In `apps/web/actions/videos/get-status.ts`, the upload record query uses `limit(1)` with no phase filter. If a "complete" row is returned while an active upload also exists, the JS-side phase check lets it through and incorrectly proceeds to trigger transcription (or conversely, the wrong row blocks transcription). The fix is to filter in SQL to only return active-phase rows.
 
 Bug 4 (TSRF-004): In `apps/web/actions/videos/get-status.ts`, only "uploading" records get stale cleanup. Records stuck in "processing" or "generating_thumbnail" can stall indefinitely, permanently blocking transcription for that video.
+
+Bug 5 (TSRF-005, post-build): The stale cleanup query selects an arbitrary row (no ordering) then deletes ALL rows for the videoId. Although the primary key constraint currently limits this to one row per videoId, the delete-by-videoId pattern is unnecessarily broad. A race condition between the SELECT and DELETE could delete a freshly-updated row if the upload phase transitions between the two queries. The fix is to order by `updatedAt` desc and only delete rows whose `updatedAt` is actually stale.
+
+Bug 6 (TSRF-006, post-build): A single 5-minute timeout for all upload phases is too aggressive for "processing" and "generating_thumbnail". Media-server conversion (processing) can legitimately take 15 minutes for large videos, and thumbnail generation can take 10 minutes. Using phase-specific timeouts avoids false stale cleanup.
 
 ## Design
 
@@ -45,7 +48,15 @@ Replace the `limit(1)` query that fetches any upload row with a query filtered t
 
 ### TSRF-004: Stale cleanup covers all active phases
 
-Extend the stale upload cleanup to handle records stuck in any active phase (uploading, processing, generating_thumbnail), not just "uploading". All use the same 5-minute timeout.
+Extend the stale upload cleanup to handle records stuck in any active phase (uploading, processing, generating_thumbnail), not just "uploading".
+
+### TSRF-005: Order query by updatedAt, delete only stale rows
+
+Add `orderBy(desc(videoUploads.updatedAt))` to get the most recently updated upload record. Change the delete to use `lt(videoUploads.updatedAt, staleThreshold)` so it only deletes rows whose `updatedAt` is actually past the stale threshold, preventing race conditions where a row gets updated between the SELECT and DELETE.
+
+### TSRF-006: Phase-specific stale timeouts
+
+Replace the single `UPLOAD_STALE_TIMEOUT_MS` with a `PHASE_STALE_TIMEOUTS` record that maps each active upload phase to its own timeout: uploading gets 5 minutes, processing gets 15 minutes, generating_thumbnail gets 10 minutes. The staleness check uses the phase-specific timeout from the fetched record.
 
 ## Acceptance Criteria
 
@@ -84,8 +95,7 @@ async function markTranscriptionError(
 			.from(videos)
 			.where(eq(videos.id, videoId));
 
-		const currentMetadata =
-			(currentVideo?.metadata as VideoMetadata) || {};
+		const currentMetadata = (currentVideo?.metadata as VideoMetadata) || {};
 
 		await db()
 			.update(videos)
@@ -274,7 +284,7 @@ import type { VideoMetadata } from "@cap/database/types";
 import { serverEnv } from "@cap/env";
 import { provideOptionalAuth, VideosPolicy } from "@cap/web-backend";
 import { Policy, type Video } from "@cap/web-domain";
-import { and, eq, inArray } from "drizzle-orm";
+import { and, desc, eq, inArray, lt } from "drizzle-orm";
 import { Effect, Exit } from "effect";
 import { startAiGeneration } from "@/lib/generate-ai";
 import * as EffectRuntime from "@/lib/server";
@@ -315,7 +325,13 @@ const ACTIVE_UPLOAD_PHASES = [
 	"generating_thumbnail",
 ] as const;
 
-const UPLOAD_STALE_TIMEOUT_MS = 5 * 60 * 1000;
+const PHASE_STALE_TIMEOUTS: Record<string, number> = {
+	uploading: 5 * 60 * 1000,
+	processing: 15 * 60 * 1000,
+	generating_thumbnail: 10 * 60 * 1000,
+};
+
+const DEFAULT_STALE_TIMEOUT_MS = 5 * 60 * 1000;
 
 export async function getVideoStatus(
 	videoId: Video.VideoId,
@@ -351,20 +367,29 @@ export async function getVideoStatus(
 					inArray(videoUploads.phase, [...ACTIVE_UPLOAD_PHASES]),
 				),
 			)
+			.orderBy(desc(videoUploads.updatedAt))
 			.limit(1);
 
 		if (activeUpload.length > 0) {
 			const upload = activeUpload[0]!;
 			const ageMs = Date.now() - new Date(upload.updatedAt).getTime();
-			const isStale = ageMs > UPLOAD_STALE_TIMEOUT_MS;
+			const phaseTimeout =
+				PHASE_STALE_TIMEOUTS[upload.phase] ?? DEFAULT_STALE_TIMEOUT_MS;
+			const isStale = ageMs > phaseTimeout;
 
 			if (isStale) {
+				const staleThreshold = new Date(Date.now() - phaseTimeout);
 				console.log(
 					`[Get Status] Cleaning up stale upload record for video ${videoId} (phase: ${upload.phase}, age: ${Math.round(ageMs / 1000)}s)`,
 				);
 				await db()
 					.delete(videoUploads)
-					.where(eq(videoUploads.videoId, videoId));
+					.where(
+						and(
+							eq(videoUploads.videoId, videoId),
+							lt(videoUploads.updatedAt, staleThreshold),
+						),
+					);
 			} else {
 				return {
 					transcriptionStatus: null,
@@ -510,11 +535,11 @@ export async function getVideoStatus(
 
 ## Open Questions
 
-- None. All four fixes are straightforward and isolated.
+- None. All six fixes are straightforward and isolated.
 
 ## Key Files
 
 - `apps/web/lib/transcribe.ts` - Transcription orchestrator. Changed timeout from 2min to 5min, stale handler from null-reset to ERROR status, added string timestamp parsing with NaN guard, fixed outer catch block to set ERROR instead of null, extracted `markTranscriptionError` helper to deduplicate error-writing logic.
-- `apps/web/actions/videos/get-status.ts` - Video status polling endpoint. Changed upload query to filter active phases in SQL via `inArray`, extended stale cleanup to all active phases (not just "uploading").
+- `apps/web/actions/videos/get-status.ts` - Video status polling endpoint. Changed upload query to filter active phases in SQL via `inArray`, added `orderBy(desc(updatedAt))` for deterministic row selection, changed delete to only remove stale rows via `lt(updatedAt, threshold)`, introduced phase-specific stale timeouts (uploading: 5min, processing: 15min, generating_thumbnail: 10min).
 - `packages/database/types/metadata.ts` - VideoMetadata type (unchanged, already has `transcriptionError` and `transcriptionStartedAt` fields).
 - `packages/database/schema.ts` - videoUploads schema (unchanged, phase type already includes all five phases).

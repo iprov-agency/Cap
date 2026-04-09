@@ -72,3 +72,5 @@ analysis/plans/
 .ralphy
 tmp/.pnpm-store/
 package-lock.json
+.pnpm-store/
+package-lock.json
