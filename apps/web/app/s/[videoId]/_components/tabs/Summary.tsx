@@ -253,8 +253,16 @@ export const Summary: React.FC<SummaryProps> = ({
 								{aiData.chapters.map((chapter) => (
 									<div
 										key={chapter.start}
+										role="button"
+										tabIndex={0}
 										className="flex items-center p-2 rounded transition-colors cursor-pointer hover:bg-gray-100"
 										onClick={() => handleSeek(chapter.start)}
+										onKeyDown={(e) => {
+											if (e.key === "Enter" || e.key === " ") {
+												e.preventDefault();
+												handleSeek(chapter.start);
+											}
+										}}
 									>
 										<span className="w-16 text-xs text-gray-500">
 											{formatTime(chapter.start)}
