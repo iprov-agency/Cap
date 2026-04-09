@@ -1,3 +1,73 @@
+---
+created: 2026-04-09
+system: cap
+status: approved
+content_hash: cad77a8e248c5629b18b76df71f871cfd68b8d461017894a87d164a3bf8f5235
+target_agent: worktree
+acceptance_criteria:
+  - "Do all helper functions wrap DB operations in try/catch with graceful degradation?"
+  - "Does buildStatusResponse validate transcriptionStatus against known values?"
+  - "Does triggerTranscription clear stale error/progress metadata when returning PROCESSING?"
+  - "Does triggerAiGenerationIfEligible check for existing PROCESSING status before triggering?"
+depends_on:
+  - PR8-sentrux-quality-extract-helpers-from-getvideostatus
+supersedes:
+repos:
+  - Cap
+---
+
+# GetStatus Hardening
+
+## Problem
+
+Four pre-existing quality issues in `apps/web/actions/videos/get-status.ts` were surfaced by Codex during the sentrux refactor. The file was refactored in PR #8 to extract helper functions (`checkActiveUploads`, `triggerTranscription`, `triggerAiGenerationIfEligible`, `buildStatusResponse`), but these helpers lack error handling and validation. Transient DB errors in `checkActiveUploads` abort the entire request, corrupted transcription status values leak to clients, stale error metadata persists across transcription restarts, and concurrent polls can trigger duplicate AI generation jobs. Additionally, the AI generation metadata write uses a read-then-write spread pattern that can clobber concurrent metadata updates, and `startAiGeneration` failures leave the status stuck at PROCESSING with no rollback.
+
+## Design
+
+All fixes are contained within a single file (`apps/web/actions/videos/get-status.ts`). No schema changes, no new files, no new dependencies.
+
+### Bug 1: DB error handling in helpers
+
+Wrap `checkActiveUploads` DB operations (select and delete) in try/catch. On failure, return `"none"` so transcription can proceed rather than blocking the request. The stale-cleanup delete is already non-critical; if it fails, the next poll will retry.
+
+`triggerAiGenerationIfEligible` already has a try/catch around its DB call and returns `null` on failure. No change needed there beyond what PR #8 already provides. The outer catch already logs and continues.
+
+`triggerTranscription` is synchronous and its existing try/catch handles the `transcribeVideo` call. The `transcribeVideo` call is fire-and-forget (`.catch()` handler), so errors are already caught. No additional wrapping needed for this helper.
+
+The primary fix is `checkActiveUploads`, which has two unwrapped awaited DB calls.
+
+### Bug 2: TranscriptionStatus and AiGenerationStatus validation
+
+Add a `VALID_TRANSCRIPTION_STATUSES` constant and a type guard `isValidTranscriptionStatus`. Use it in `buildStatusResponse` to validate the `transcriptionStatus` parameter before including it in the response. If the value is not a known status, treat it as `null`.
+
+Add a `VALID_AI_GENERATION_STATUSES` constant and a type guard `isValidAiGenerationStatus`. Use it in `buildStatusResponse` to validate the `aiGenerationStatus` from metadata before including it in the response. If the value is not a known status, treat it as `null`.
+
+### Bug 3: Stale metadata on transcription restart
+
+When `triggerTranscription` returns a PROCESSING status, override `transcriptionError`, `transcriptionProgress`, and `transcriptionProgressStartedAt` to `null` via the overrides parameter of `buildStatusResponse`. This prevents stale failure data from a previous attempt from showing alongside the new PROCESSING status.
+
+### Bug 4: AI generation race condition, metadata clobber, and failure rollback
+
+Three related problems in `triggerAiGenerationIfEligible`:
+
+**Race condition (AI-RACE-001):** The previous spec used a read-then-write pattern: read metadata, check if PROCESSING/QUEUED, then write PROCESSING. Two concurrent requests can both read null and both trigger `startAiGeneration`. Fix: use a single atomic SQL UPDATE with `JSON_SET` and a WHERE clause that only matches if `aiGenerationStatus` is NOT already PROCESSING or QUEUED. Check `affectedRows` on the result: if zero rows were affected, another request already claimed the lock, so skip `startAiGeneration`.
+
+**Metadata clobber (AI-META-002):** The previous spec used `{...metadata, aiGenerationStatus: "PROCESSING"}` which reads the full metadata object, spreads it, and writes back. Any concurrent metadata updates between the read and write get overwritten. Fix: use SQL `JSON_SET` to atomically update only the `aiGenerationStatus` field without touching other metadata fields. This is the same `JSON_SET` used for the race fix above.
+
+**Stuck PROCESSING on failure (AI-STUCK-003):** If `startAiGeneration` throws, `aiGenerationStatus` stays PROCESSING permanently. Fix: in the `.catch()` handler for `startAiGeneration`, reset `aiGenerationStatus` to null using `JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', CAST(NULL AS JSON))`. This allows a future poll to retry.
+
+## Acceptance Criteria
+
+- [ ] Do all helper functions wrap DB operations in try/catch with graceful degradation?
+- [ ] Does buildStatusResponse validate transcriptionStatus against known values?
+- [ ] Does triggerTranscription clear stale error/progress metadata when returning PROCESSING?
+- [ ] Does triggerAiGenerationIfEligible check for existing PROCESSING status before triggering?
+
+## Implementation
+
+### `apps/web/actions/videos/get-status.ts`
+
+```typescript
 "use server";
 
 import { db } from "@cap/database";
@@ -93,7 +163,9 @@ function buildStatusResponse(
 	metadata: VideoMetadata,
 	overrides?: Partial<VideoStatusResult>,
 ): VideoStatusResult {
-	const validatedTranscription = isValidTranscriptionStatus(transcriptionStatus)
+	const validatedTranscription = isValidTranscriptionStatus(
+		transcriptionStatus,
+	)
 		? transcriptionStatus
 		: null;
 
@@ -340,3 +412,18 @@ export async function getVideoStatus(
 
 	return buildStatusResponse(video.transcriptionStatus, metadata);
 }
+```
+
+## Open Questions
+
+- The `startAiGeneration` function in `generate-ai.ts` also uses the read-then-write spread pattern (`{...metadata, aiGenerationStatus: "QUEUED"}`) when setting its own status. This is the same metadata clobber vulnerability (AI-META-002) but on the `generate-ai.ts` side. Fixing that file is out of scope for this spec since it would change the generate-ai module's contract, but it should be addressed in a follow-up.
+- The atomic claim write sets `aiGenerationStatus` to `"PROCESSING"`, then `startAiGeneration` overwrites it to `"QUEUED"` via its own DB write. Both values cause the guard to skip, and the brief PROCESSING-to-QUEUED transition is not user-visible. However, if a future change to `startAiGeneration` removes its own QUEUED write, the status would remain PROCESSING permanently. This coupling should be documented if it becomes a concern.
+- The `.catch()` rollback in `triggerAiGenerationIfEligible` resets `aiGenerationStatus` to null using `CAST(NULL AS JSON)`. This means a future poll could retry the generation. If `startAiGeneration` fails repeatedly, this creates a retry loop bounded only by the poll interval. Rate limiting or a retry counter could be added in a follow-up if this becomes a problem.
+
+## Key Files
+
+- `apps/web/actions/videos/get-status.ts` - Server action for video status polling. All four hardening fixes are in this file.
+- `apps/web/lib/generate-ai.ts` - Called by `triggerAiGenerationIfEligible`. Has its own PROCESSING/QUEUED idempotency guard (defense-in-depth). Also uses the spread pattern for metadata writes (out of scope).
+- `apps/web/lib/video-processing.ts` - Contains the `getAffectedRows` helper pattern used as reference for the new helper in this file.
+- `packages/database/types/metadata.ts` - Defines `VideoMetadata` interface (unchanged).
+- `packages/database/schema.ts` - Defines `transcriptionStatus` enum on the videos table (unchanged).
