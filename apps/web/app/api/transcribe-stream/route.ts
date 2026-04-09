@@ -4,7 +4,7 @@ import { s3Buckets, videos } from "@cap/database/schema";
 import { serverEnv } from "@cap/env";
 import { S3Buckets } from "@cap/web-backend";
 import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { Option } from "effect";
 import type { NextRequest } from "next/server";
 import { GEMINI_AUDIO_MODEL, getGeminiClient } from "@/lib/gemini-client";
@@ -103,7 +103,10 @@ export async function POST(request: NextRequest) {
 
 		await db()
 			.update(videos)
-			.set({ transcriptionStatus: "PROCESSING" })
+			.set({
+				transcriptionStatus: "PROCESSING",
+				metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.transcriptionStartedAt', ${Date.now()})`,
+			})
 			.where(eq(videos.id, videoId as Video.VideoId));
 
 		const audioBase64 = Buffer.from(audioBuffer).toString("base64");
@@ -156,10 +159,26 @@ Be precise with the timestamps and transcribe every word spoken. If there are mu
 
 		return Response.json({ success: true });
 	} catch (err) {
+		const errorMessage =
+			err instanceof Error ? err.message : "Streaming transcription failed";
 		console.error(
 			`[transcribe-stream] Failed to transcribe video ${videoId}:`,
 			err,
 		);
+		try {
+			await db()
+				.update(videos)
+				.set({
+					transcriptionStatus: "ERROR",
+					metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.transcriptionError', ${errorMessage}, '$.transcriptionProgress', CAST(NULL AS JSON), '$.transcriptionProgressStartedAt', CAST(NULL AS JSON))`,
+				})
+				.where(eq(videos.id, videoId as Video.VideoId));
+		} catch (dbErr) {
+			console.error(
+				`[transcribe-stream] Failed to save error status for ${videoId}:`,
+				dbErr,
+			);
+		}
 		return Response.json({ error: "Transcription failed" }, { status: 500 });
 	}
 }

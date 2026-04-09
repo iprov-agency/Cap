@@ -2,7 +2,6 @@
 created: 2026-04-09
 system: cap
 status: approved
-content_hash: e671c49ab390d200a36b6915932ec01186a33e044ded69fba4c8b8c0b2082ed1
 target_agent: worktree
 acceptance_criteria:
   - "Does the web recorder start streaming audio extraction to an in-memory buffer when recording begins?"
@@ -36,11 +35,11 @@ When recording starts, `createStreamingTranscription(videoId)` creates a Web Aud
 
 ### Server-side transcription
 
-The POST handler at `/api/transcribe-stream` receives the WAV audio body, validates the content-type header and RIFF/WAVE magic bytes, enforces a 20MB request size limit, validates the user session, looks up the video, sets the transcription status to PROCESSING before calling Gemini (to prevent the post-upload workflow from starting a duplicate), sends the audio to Gemini for transcription (reusing the existing Gemini client and prompt pattern), converts the result to WebVTT, and saves it to R2. It marks the video's `transcriptionStatus` as `COMPLETE`.
+The POST handler at `/api/transcribe-stream` receives the WAV audio body, validates the content-type header and RIFF/WAVE magic bytes, enforces a 20MB request size limit, validates the user session, looks up the video, sets the transcription status to PROCESSING with a `transcriptionStartedAt` timestamp in metadata (matching the pattern used in `workflows/transcribe.ts` for stale detection), sends the audio to Gemini for transcription (reusing the existing Gemini client and prompt pattern), converts the result to WebVTT, and saves it to R2. It marks the video's `transcriptionStatus` as `COMPLETE`. If any error occurs during processing, the catch block sets `transcriptionStatus` to `ERROR` with the error message stored in metadata, preventing the status from being stuck on PROCESSING indefinitely.
 
 ### Fallback path
 
-In `transcribeVideo()`, before triggering the transcription workflow, the code checks if a `transcription.vtt` file already exists in S3 for the video. If it does, the function marks the status as COMPLETE and returns early. The S3 existence check distinguishes not-found errors from other S3 failures, re-throwing non-404 errors so they propagate correctly. If the streaming transcription failed silently (network error, audio extraction issue, Gemini error), the existing post-upload transcription path runs normally as a fallback.
+In `transcribeVideo()`, before triggering the transcription workflow, the code checks if a `transcription.vtt` file already exists in S3 for the video. If it does, the function marks the status as COMPLETE and returns early. The S3 existence check is best-effort: not-found responses return false, but transient S3 errors (timeouts, 500s) are logged and also return false, allowing the post-upload transcription to proceed as a fallback rather than blocking on a transient failure. If the streaming transcription failed silently (network error, audio extraction issue, Gemini error), the existing post-upload transcription path runs normally as a fallback.
 
 ### Data flow
 
@@ -49,9 +48,10 @@ In `transcribeVideo()`, before triggering the transcription workflow, the code c
 3. User clicks stop. `stopRecording()` calls `streamingTranscriptionRef.current.stop()`
 4. `stop()` encodes accumulated PCM as WAV and POSTs to `/api/transcribe-stream`
 5. Server validates content-type, size, and WAV magic bytes
-6. Server sets transcriptionStatus to PROCESSING, then transcribes with Gemini, saves VTT to R2, marks video COMPLETE
-7. Concurrently, video upload proceeds normally
-8. When the upload completes, `transcribeVideo()` checks S3 for existing VTT, finds it, skips
+6. Server sets transcriptionStatus to PROCESSING with transcriptionStartedAt timestamp, then transcribes with Gemini, saves VTT to R2, marks video COMPLETE
+7. If the server fails at any point after PROCESSING is set, it marks the video as ERROR with the error message in metadata
+8. Concurrently, video upload proceeds normally
+9. When the upload completes, `transcribeVideo()` checks S3 for existing VTT, finds it, skips
 
 ## Acceptance Criteria
 
@@ -299,7 +299,7 @@ export function createStreamingTranscription(
 
 ### `apps/web/app/api/transcribe-stream/route.ts`
 
-Server-side POST endpoint that receives WAV audio, transcribes with Gemini, and saves WebVTT to R2. Fixes applied: 20MB request size limit (ST-005), content-type and RIFF/WAVE magic bytes validation (ST-006), PROCESSING marker set before Gemini call (ST-008).
+Server-side POST endpoint that receives WAV audio, transcribes with Gemini, and saves WebVTT to R2. Fixes applied: 20MB request size limit (ST-005), content-type and RIFF/WAVE magic bytes validation (ST-006), PROCESSING marker with transcriptionStartedAt timestamp (ST-008, ST-009), ERROR status on failure (ST-010).
 
 ```typescript
 import { db } from "@cap/database";
@@ -308,7 +308,7 @@ import { s3Buckets, videos } from "@cap/database/schema";
 import { serverEnv } from "@cap/env";
 import { S3Buckets } from "@cap/web-backend";
 import type { Video } from "@cap/web-domain";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { Option } from "effect";
 import type { NextRequest } from "next/server";
 import { GEMINI_AUDIO_MODEL, getGeminiClient } from "@/lib/gemini-client";
@@ -413,7 +413,10 @@ export async function POST(request: NextRequest) {
 
 		await db()
 			.update(videos)
-			.set({ transcriptionStatus: "PROCESSING" })
+			.set({
+				transcriptionStatus: "PROCESSING",
+				metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.transcriptionStartedAt', ${Date.now()})`,
+			})
 			.where(eq(videos.id, videoId as Video.VideoId));
 
 		const audioBase64 = Buffer.from(audioBuffer).toString("base64");
@@ -466,10 +469,26 @@ Be precise with the timestamps and transcribe every word spoken. If there are mu
 
 		return Response.json({ success: true });
 	} catch (err) {
+		const errorMessage =
+			err instanceof Error ? err.message : "Streaming transcription failed";
 		console.error(
 			`[transcribe-stream] Failed to transcribe video ${videoId}:`,
 			err,
 		);
+		try {
+			await db()
+				.update(videos)
+				.set({
+					transcriptionStatus: "ERROR",
+					metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.transcriptionError', ${errorMessage}, '$.transcriptionProgress', CAST(NULL AS JSON), '$.transcriptionProgressStartedAt', CAST(NULL AS JSON))`,
+				})
+				.where(eq(videos.id, videoId as Video.VideoId));
+		} catch (dbErr) {
+			console.error(
+				`[transcribe-stream] Failed to save error status for ${videoId}:`,
+				dbErr,
+			);
+		}
 		return Response.json(
 			{ error: "Transcription failed" },
 			{ status: 500 },
@@ -547,7 +566,7 @@ After the line `onRecordingStop?.();` and before `updatePhase("creating");`, ins
 
 ### `apps/web/lib/transcribe.ts`
 
-Complete replacement of the file. The key change is in `transcribeVideo()`: before triggering the workflow, it checks if a streaming transcript already exists in S3. The `checkStreamingTranscriptExists` function now distinguishes NotFound from other S3 errors (ST-007 fix), only returning false for not-found and re-throwing other errors.
+Complete replacement of the file. Changes from previous version: `checkStreamingTranscriptExists` now treats all non-NotFound S3 errors as best-effort failures (logs and returns false) instead of re-throwing, so transient S3 errors do not block the post-upload transcription fallback.
 
 ```typescript
 import { db } from "@cap/database";
@@ -605,11 +624,7 @@ function isS3NotFoundError(err: unknown): boolean {
 		const cause = err.cause;
 		if (Cause.isFailType(cause)) {
 			const s3Error = cause.error;
-			if (
-				s3Error &&
-				typeof s3Error === "object" &&
-				"cause" in s3Error
-			) {
+			if (s3Error && typeof s3Error === "object" && "cause" in s3Error) {
 				const underlying = (s3Error as { cause: unknown }).cause;
 				if (
 					underlying &&
@@ -624,8 +639,9 @@ function isS3NotFoundError(err: unknown): boolean {
 					typeof underlying === "object" &&
 					"$metadata" in underlying
 				) {
-					const metadata = (underlying as { $metadata: { httpStatusCode?: number } })
-						.$metadata;
+					const metadata = (
+						underlying as { $metadata: { httpStatusCode?: number } }
+					).$metadata;
 					return metadata?.httpStatusCode === 404;
 				}
 			}
@@ -653,7 +669,11 @@ async function checkStreamingTranscriptExists(
 		if (isS3NotFoundError(err)) {
 			return false;
 		}
-		throw err;
+		console.error(
+			`[transcribeVideo] S3 error checking streaming transcript for ${videoId}:`,
+			err,
+		);
+		return false;
 	}
 }
 
@@ -850,6 +870,6 @@ export async function transcribeVideo(
 
 - `apps/web/lib/audio-pcm.ts` - NEW. PCM conversion utilities (OfflineAudioContext downsample, float-to-int16, WAV encoding)
 - `apps/web/lib/streaming-transcription.ts` - NEW. Client-side audio extraction with duration cap, zero-gain echo prevention, AudioContext resume
-- `apps/web/app/api/transcribe-stream/route.ts` - NEW. Server POST endpoint with size limit, content-type/WAV validation, PROCESSING marker
+- `apps/web/app/api/transcribe-stream/route.ts` - NEW. Server POST endpoint with size limit, content-type/WAV validation, PROCESSING marker with timestamp, ERROR on failure
 - `apps/web/app/(org)/dashboard/caps/components/web-recorder-dialog/useWebRecorder.ts` - MODIFIED. Integration hooks for start/stop/cleanup
-- `apps/web/lib/transcribe.ts` - MODIFIED. Skip workflow if streaming transcript exists in S3, NotFound-specific error handling
+- `apps/web/lib/transcribe.ts` - MODIFIED. Skip workflow if streaming transcript exists in S3, best-effort S3 check (no throw on transient errors)

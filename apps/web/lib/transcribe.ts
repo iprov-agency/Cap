@@ -98,7 +98,11 @@ async function checkStreamingTranscriptExists(
 		if (isS3NotFoundError(err)) {
 			return false;
 		}
-		throw err;
+		console.error(
+			`[transcribeVideo] S3 error checking streaming transcript for ${videoId}:`,
+			err,
+		);
+		return false;
 	}
 }
 
