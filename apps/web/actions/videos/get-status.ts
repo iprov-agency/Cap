@@ -373,6 +373,7 @@ export async function getVideoStatus(
 		normalizedTranscriptionStatus === "COMPLETE" &&
 		!normalizedAiGenerationStatus &&
 		!metadata.summary &&
+		!metadata.chapters?.length &&
 		serverEnv().GOOGLE_API_KEY;
 
 	if (shouldTriggerAiGeneration) {
