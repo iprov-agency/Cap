@@ -424,7 +424,7 @@ app.post(
 						);
 
 						isRawUpload = true;
-						uploadBucketId = video.bucketId;
+						uploadBucketId = Option.getOrNull(video.bucketId) as string | null;
 						uploadSucceeded = true;
 
 						return c.json({
