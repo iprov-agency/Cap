@@ -5,13 +5,14 @@ import { S3Buckets } from "@cap/web-backend";
 import type { S3Bucket, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
-// FatalError from workflow package not available without workflow runtime
-class FatalError extends Error {
+
+export class FatalError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "FatalError";
 	}
 }
+
 import { GEMINI_TEXT_MODEL, getGeminiClient } from "@/lib/gemini-client";
 import { runPromise } from "@/lib/server";
 
@@ -44,31 +45,75 @@ interface AiResult {
 
 const MAX_CHARS_PER_CHUNK = 24000;
 
-export async function generateAiWorkflow(payload: GenerateAiWorkflowPayload) {
+export const CONTROL_FLOW_FATAL_MESSAGES = [
+	"AI metadata already generated",
+	"Transcription not complete",
+];
 
+export async function generateAiWorkflow(payload: GenerateAiWorkflowPayload) {
 	const { videoId, userId } = payload;
 
-	const videoData = await validateAndSetProcessing(videoId);
+	try {
+		const videoData = await validateAndSetProcessing(videoId);
 
-	const transcript = await fetchTranscript(videoId, userId, videoData.bucketId);
+		const transcript = await fetchTranscript(
+			videoId,
+			userId,
+			videoData.bucketId,
+		);
 
-	if (!transcript) {
-		await markSkipped(videoId, videoData.metadata);
-		return {
-			success: true,
-			message: "Transcript empty or too short - skipped",
-		};
+		if (!transcript) {
+			await markSkipped(videoId, videoData.metadata);
+			return {
+				success: true,
+				message: "Transcript empty or too short - skipped",
+			};
+		}
+
+		const result = await generateWithAi(transcript);
+
+		await saveResults(videoId, videoData, result);
+
+		return { success: true, message: "AI generation completed successfully" };
+	} catch (error) {
+		if (
+			error instanceof FatalError &&
+			CONTROL_FLOW_FATAL_MESSAGES.includes(error.message)
+		) {
+			throw error;
+		}
+		console.error(
+			`[generateAiWorkflow] Unhandled error for video ${videoId}:`,
+			error,
+		);
+		try {
+			const freshQuery = await db()
+				.select({ metadata: videos.metadata })
+				.from(videos)
+				.where(eq(videos.id, videoId as Video.VideoId));
+			const freshMetadata = (freshQuery[0]?.metadata as VideoMetadata) || {};
+			if (freshMetadata.aiGenerationStatus !== "COMPLETE") {
+				await db()
+					.update(videos)
+					.set({
+						metadata: {
+							...freshMetadata,
+							aiGenerationStatus: "ERROR",
+						},
+					})
+					.where(eq(videos.id, videoId as Video.VideoId));
+			}
+		} catch (dbErr) {
+			console.error(
+				`[generateAiWorkflow] Failed to set ERROR status for ${videoId}:`,
+				dbErr,
+			);
+		}
+		throw error;
 	}
-
-	const result = await generateWithAi(transcript);
-
-	await saveResults(videoId, videoData, result);
-
-	return { success: true, message: "AI generation completed successfully" };
 }
 
 async function validateAndSetProcessing(videoId: string): Promise<VideoData> {
-
 	const gemini = getGeminiClient();
 	if (!gemini) {
 		throw new FatalError("Missing GOOGLE_API_KEY for Gemini");
@@ -91,7 +136,7 @@ async function validateAndSetProcessing(videoId: string): Promise<VideoData> {
 		throw new FatalError("Transcription not complete");
 	}
 
-	if (metadata.summary && metadata.chapters) {
+	if (metadata.summary && metadata.chapters?.length) {
 		throw new FatalError("AI metadata already generated");
 	}
 
@@ -117,7 +162,6 @@ async function fetchTranscript(
 	userId: string,
 	bucketId: S3Bucket.S3BucketId | null,
 ): Promise<TranscriptData | null> {
-
 	const vtt = await Effect.gen(function* () {
 		const [bucket] = yield* S3Buckets.getBucketAccess(
 			Option.fromNullable(bucketId),
@@ -146,7 +190,6 @@ async function markSkipped(
 	videoId: string,
 	metadata: VideoMetadata,
 ): Promise<void> {
-
 	await db()
 		.update(videos)
 		.set({
@@ -159,7 +202,6 @@ async function markSkipped(
 }
 
 async function generateWithAi(transcript: TranscriptData): Promise<AiResult> {
-
 	const chunks = chunkTranscriptWithTimestamps(transcript.segments);
 
 	if (chunks.length === 1) {
@@ -174,7 +216,6 @@ async function saveResults(
 	videoData: VideoData,
 	result: AiResult,
 ): Promise<void> {
-
 	const { video, metadata } = videoData;
 
 	const updatedMetadata: VideoMetadata = {
@@ -289,9 +330,7 @@ function cleanJsonResponse(content: string): string {
 	return content;
 }
 
-async function generateSingleChunk(
-	transcriptText: string,
-): Promise<AiResult> {
+async function generateSingleChunk(transcriptText: string): Promise<AiResult> {
 	const prompt = `You are Cap AI, an expert at analyzing video content and creating comprehensive summaries.
 
 Analyze this transcript thoroughly and provide a detailed JSON response:
