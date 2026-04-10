@@ -190,6 +190,10 @@ export function CapVideoPlayer({
 		uploadProgress?.status === "generating_thumbnail";
 	const hasActiveProgress =
 		isUploading || isProcessing || isGeneratingThumbnail;
+	const hasActiveProcessingRaw =
+		uploadProgressRaw?.status === "uploading" ||
+		uploadProgressRaw?.status === "processing" ||
+		uploadProgressRaw?.status === "generating_thumbnail";
 	const shouldDeferResolvedSource = shouldDeferPlaybackSource(uploadProgress);
 
 	const resolvedSrc = useQuery<ResolvedPlaybackSource | null>({
@@ -663,7 +667,9 @@ export function CapVideoPlayer({
 		!resolvedSrc.data &&
 		!resolvedSrc.isPending;
 	const showRawPlaybackBadge =
-		showPlaybackStatusBadge && resolvedSrc.data?.type === "raw";
+		showPlaybackStatusBadge &&
+		resolvedSrc.data?.type === "raw" &&
+		hasActiveProcessingRaw;
 	const rawPlaybackBadgeLabel =
 		uploadProgressRaw?.status === "error"
 			? "Original upload"

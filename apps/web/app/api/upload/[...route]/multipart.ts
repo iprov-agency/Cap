@@ -23,6 +23,7 @@ import { z } from "zod";
 import { withAuth } from "@/app/api/utils";
 import { runPromise } from "@/lib/server";
 import { transcribeVideo } from "@/lib/transcribe";
+import { startVideoProcessingWorkflow } from "@/lib/video-processing";
 import { stringOrNumberOptional } from "@/utils/zod";
 import {
 	getMultipartFileKey,
@@ -278,6 +279,8 @@ app.post(
 		const videoIdRaw = "videoId" in body ? body.videoId : videoIdFromFileKey;
 
 		let uploadSucceeded = false;
+		let isRawUpload = false;
+		let uploadBucketId: string | null = null;
 
 		const response = await Effect.gen(function* () {
 			const repo = yield* VideosRepo;
@@ -401,17 +404,17 @@ app.post(
 									.insert(Db.videoUploads)
 									.values({
 										videoId: Video.VideoId.make(videoId),
-										phase: "complete",
+										phase: "uploading",
 										rawFileKey: fileKey,
-										processingProgress: 100,
+										processingProgress: 0,
 										processingError: null,
 										processingMessage: null,
 									})
 									.onDuplicateKeyUpdate({
 										set: {
-											phase: "complete",
+											phase: "uploading",
 											rawFileKey: fileKey,
-											processingProgress: 100,
+											processingProgress: 0,
 											processingError: null,
 											processingMessage: null,
 											updatedAt: new Date(),
@@ -420,6 +423,8 @@ app.post(
 							}),
 						);
 
+						isRawUpload = true;
+						uploadBucketId = video.bucketId;
 						uploadSucceeded = true;
 
 						return c.json({
@@ -619,10 +624,27 @@ app.post(
 			runPromiseAnyEnv,
 		);
 
-		if (videoIdRaw && uploadSucceeded) {
+		if (videoIdRaw && uploadSucceeded && !isRawUpload) {
 			transcribeVideo(Video.VideoId.make(videoIdRaw), user.id).catch((err) => {
 				console.error(
 					`[multipart] Transcription trigger failed for ${videoIdRaw}:`,
+					err,
+				);
+			});
+		}
+
+		if (videoIdRaw && uploadSucceeded && isRawUpload) {
+			startVideoProcessingWorkflow({
+				videoId: Video.VideoId.make(videoIdRaw),
+				userId: user.id,
+				rawFileKey: fileKey,
+				bucketId: uploadBucketId,
+				processingMessage: "Processing uploaded recording",
+				startFailureMessage: "Failed to start video processing",
+				mode: "multipart",
+			}).catch((err) => {
+				console.error(
+					`[multipart] Video processing trigger failed for ${videoIdRaw}:`,
 					err,
 				);
 			});
