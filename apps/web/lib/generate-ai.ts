@@ -81,9 +81,33 @@ export async function startAiGeneration(
 			})
 			.where(eq(videos.id, videoId));
 
-		// Call workflow directly (bypass workflow RPC engine, not available in self-hosted)
-		generateAiWorkflow({ videoId, userId }).catch((err) => {
+		generateAiWorkflow({ videoId, userId }).catch(async (err) => {
 			console.error(`[generateAi] Workflow failed for ${videoId}:`, err);
+			try {
+				const freshQuery = await db()
+					.select({ metadata: videos.metadata })
+					.from(videos)
+					.where(eq(videos.id, videoId));
+				const freshMetadata = (freshQuery[0]?.metadata as VideoMetadata) || {};
+				if (freshMetadata.aiGenerationStatus === "COMPLETE") {
+					return;
+				}
+				await db()
+					.update(videos)
+					.set({
+						metadata: {
+							...freshMetadata,
+							aiGenerationStatus: "ERROR",
+							aiGenerationClaimedAt: null,
+						},
+					})
+					.where(eq(videos.id, videoId));
+			} catch (dbErr) {
+				console.error(
+					`[generateAi] Failed to set ERROR status for ${videoId}:`,
+					dbErr,
+				);
+			}
 		});
 
 		return {
