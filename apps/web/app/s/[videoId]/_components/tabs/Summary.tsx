@@ -101,13 +101,14 @@ export const Summary: React.FC<SummaryProps> = ({
 		isOwner &&
 		(aiGenerationStatus === "ERROR" || aiGenerationStatus === "SKIPPED");
 
+	const hasCompleteAiMetadata =
+		Boolean(aiData?.summary) && Boolean(aiData?.chapters?.length);
 	const canGenerate =
 		isOwner &&
 		aiGenerationEnabled &&
 		transcriptionStatus === "COMPLETE" &&
 		!aiGenerationStatus &&
-		!aiData?.summary &&
-		!aiData?.chapters?.length;
+		!hasCompleteAiMetadata;
 
 	const handleSeek = (time: number) => {
 		if (onSeek) {
