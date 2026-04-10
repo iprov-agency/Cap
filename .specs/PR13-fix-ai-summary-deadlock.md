@@ -26,11 +26,11 @@ Additionally, two error recovery gaps exist: (1) the `.catch()` handler in `gene
 
 Three targeted changes to fix the deadlock and add error recovery:
 
-1. **get-status.ts: bypass startAiGeneration, call generateAiWorkflow directly.** Since `triggerAiGenerationIfEligible` already atomically claimed the work (set PROCESSING via SQL), it should call `generateAiWorkflow` directly. This bypasses `startAiGeneration`'s status guard that causes the deadlock. The `.catch()` handler already exists and resets the claim on error; we update it to also work with the new call target.
+1. **get-status.ts: bypass startAiGeneration, call generateAiWorkflow directly.** Since `triggerAiGenerationIfEligible` already atomically claimed the work (set PROCESSING via SQL), it should call `generateAiWorkflow` directly. This bypasses `startAiGeneration`'s status guard that causes the deadlock. The `.catch()` handler uses a guarded read-then-update pattern: it skips the ERROR update for control-flow FatalErrors, reads fresh metadata before writing, and skips the write if the status is already COMPLETE or if summary and chapters already exist.
 
 2. **generate-ai.ts: update status to ERROR in .catch handler.** When `generateAiWorkflow` fires from `startAiGeneration` and fails, the `.catch()` must update the database status to ERROR so the user can retry. This applies to the API route callers (retry-ai, video/ai) that still go through `startAiGeneration`. The handler guards against overwriting a COMPLETE status (in case a concurrent workflow succeeded) and clears `aiGenerationClaimedAt` to release stale claims.
 
-3. **workflows/generate-ai.ts: add top-level try/catch.** Wrap the workflow body in a try/catch that sets `aiGenerationStatus` to ERROR on any unhandled failure. Control-flow FatalErrors ("AI metadata already generated", "Transcription not complete") are excluded from the ERROR status update since they represent expected conditions, not failures. This ensures no code path can leave the status stuck at PROCESSING.
+3. **workflows/generate-ai.ts: add top-level try/catch.** Wrap the workflow body in a try/catch that sets `aiGenerationStatus` to ERROR on any unhandled failure. Control-flow FatalErrors ("AI metadata already generated", "Transcription not complete") are excluded from the ERROR status update since they represent expected conditions, not failures. Export `FatalError` and `CONTROL_FLOW_FATAL_MESSAGES` so callers can apply the same guards. This ensures no code path can leave the status stuck at PROCESSING.
 
 ### Why not change startAiGeneration itself?
 
@@ -58,7 +58,11 @@ import { provideOptionalAuth, VideosPolicy } from "@cap/web-backend";
 import { Policy, type Video } from "@cap/web-domain";
 import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import { Effect, Exit } from "effect";
-import { generateAiWorkflow } from "@/workflows/generate-ai";
+import {
+	CONTROL_FLOW_FATAL_MESSAGES,
+	FatalError,
+	generateAiWorkflow,
+} from "@/workflows/generate-ai";
 import * as EffectRuntime from "@/lib/server";
 import { transcribeVideo } from "../../lib/transcribe";
 import { isAiGenerationEnabled } from "../../utils/flags";
@@ -322,17 +326,45 @@ async function triggerAiGenerationIfEligible(
 				`[Get Status] AI generation not started for video ${videoId}, triggering generation`,
 			);
 			generateAiWorkflow({ videoId, userId: ownerId }).catch(async (error) => {
+				if (
+					error instanceof FatalError &&
+					CONTROL_FLOW_FATAL_MESSAGES.includes(error.message)
+				) {
+					return;
+				}
 				console.error(
 					`[Get Status] Error in AI generation workflow for video ${videoId}:`,
 					error,
 				);
-				await db()
-					.update(videos)
-					.set({
-						metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', 'ERROR', '$.aiGenerationClaimedAt', CAST(NULL AS JSON))`,
-					})
-					.where(eq(videos.id, videoId))
-					.catch(() => {});
+				try {
+					const freshQuery = await db()
+						.select({ metadata: videos.metadata })
+						.from(videos)
+						.where(eq(videos.id, videoId));
+					const freshMetadata =
+						(freshQuery[0]?.metadata as VideoMetadata) || {};
+					if (
+						freshMetadata.aiGenerationStatus === "COMPLETE" ||
+						(freshMetadata.summary && freshMetadata.chapters?.length)
+					) {
+						return;
+					}
+					await db()
+						.update(videos)
+						.set({
+							metadata: {
+								...freshMetadata,
+								aiGenerationStatus: "ERROR",
+								aiGenerationClaimedAt: null,
+							},
+						})
+						.where(eq(videos.id, videoId));
+				} catch (dbErr) {
+					console.error(
+						`[Get Status] Failed to set ERROR status for ${videoId}:`,
+						dbErr,
+					);
+				}
 			});
 
 			return buildStatusResponse(
@@ -595,7 +627,7 @@ import { S3Buckets } from "@cap/web-backend";
 import type { S3Bucket, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
-class FatalError extends Error {
+export class FatalError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "FatalError";
@@ -633,7 +665,7 @@ interface AiResult {
 
 const MAX_CHARS_PER_CHUNK = 24000;
 
-const CONTROL_FLOW_FATAL_MESSAGES = [
+export const CONTROL_FLOW_FATAL_MESSAGES = [
 	"AI metadata already generated",
 	"Transcription not complete",
 ];
@@ -1092,6 +1124,6 @@ function parseAiResponse(content: string): AiResult {
 
 ## Key Files
 
-- `apps/web/actions/videos/get-status.ts` - Changed import from `startAiGeneration` to `generateAiWorkflow`; changed the fire-and-forget call in `triggerAiGenerationIfEligible` to call `generateAiWorkflow` directly; updated the `.catch()` error handler to set ERROR status instead of clearing the claim.
+- `apps/web/actions/videos/get-status.ts` - Changed import to pull `FatalError` and `CONTROL_FLOW_FATAL_MESSAGES` from the workflow module; the `.catch()` handler in `triggerAiGenerationIfEligible` now skips the ERROR update for control-flow FatalErrors, reads fresh metadata before writing, and skips the write if the status is already COMPLETE or if summary and chapters already exist.
 - `apps/web/lib/generate-ai.ts` - Added error recovery in the `.catch()` handler: reads fresh metadata from DB, guards against overwriting COMPLETE status, clears `aiGenerationClaimedAt`, and sets `aiGenerationStatus` to ERROR when the workflow fails.
-- `apps/web/workflows/generate-ai.ts` - Wrapped the `generateAiWorkflow` body in a top-level try/catch that sets `aiGenerationStatus` to ERROR on any unhandled failure, then re-throws so callers still see the error. Control-flow FatalErrors ("AI metadata already generated", "Transcription not complete") are excluded from the ERROR update. The `validateAndSetProcessing` completeness check now requires a non-empty chapters array (`metadata.chapters?.length`) instead of truthiness.
+- `apps/web/workflows/generate-ai.ts` - Exported `FatalError` class and `CONTROL_FLOW_FATAL_MESSAGES` constant so callers can apply control-flow guards. Wrapped the `generateAiWorkflow` body in a top-level try/catch that sets `aiGenerationStatus` to ERROR on any unhandled failure, then re-throws so callers still see the error. Control-flow FatalErrors are excluded from the ERROR update. The `validateAndSetProcessing` completeness check now requires a non-empty chapters array (`metadata.chapters?.length`) instead of truthiness.

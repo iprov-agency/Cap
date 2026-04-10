@@ -6,7 +6,7 @@ import type { S3Bucket, Video } from "@cap/web-domain";
 import { eq } from "drizzle-orm";
 import { Effect, Option } from "effect";
 
-class FatalError extends Error {
+export class FatalError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "FatalError";
@@ -45,7 +45,7 @@ interface AiResult {
 
 const MAX_CHARS_PER_CHUNK = 24000;
 
-const CONTROL_FLOW_FATAL_MESSAGES = [
+export const CONTROL_FLOW_FATAL_MESSAGES = [
 	"AI metadata already generated",
 	"Transcription not complete",
 ];

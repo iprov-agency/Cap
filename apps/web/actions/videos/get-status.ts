@@ -9,7 +9,11 @@ import { Policy, type Video } from "@cap/web-domain";
 import { and, desc, eq, inArray, lt, sql } from "drizzle-orm";
 import { Effect, Exit } from "effect";
 import * as EffectRuntime from "@/lib/server";
-import { generateAiWorkflow } from "@/workflows/generate-ai";
+import {
+	CONTROL_FLOW_FATAL_MESSAGES,
+	FatalError,
+	generateAiWorkflow,
+} from "@/workflows/generate-ai";
 import { transcribeVideo } from "../../lib/transcribe";
 import { isAiGenerationEnabled } from "../../utils/flags";
 
@@ -272,17 +276,45 @@ async function triggerAiGenerationIfEligible(
 				`[Get Status] AI generation not started for video ${videoId}, triggering generation`,
 			);
 			generateAiWorkflow({ videoId, userId: ownerId }).catch(async (error) => {
+				if (
+					error instanceof FatalError &&
+					CONTROL_FLOW_FATAL_MESSAGES.includes(error.message)
+				) {
+					return;
+				}
 				console.error(
 					`[Get Status] Error in AI generation workflow for video ${videoId}:`,
 					error,
 				);
-				await db()
-					.update(videos)
-					.set({
-						metadata: sql`JSON_SET(COALESCE(metadata, '{}'), '$.aiGenerationStatus', 'ERROR', '$.aiGenerationClaimedAt', CAST(NULL AS JSON))`,
-					})
-					.where(eq(videos.id, videoId))
-					.catch(() => {});
+				try {
+					const freshQuery = await db()
+						.select({ metadata: videos.metadata })
+						.from(videos)
+						.where(eq(videos.id, videoId));
+					const freshMetadata =
+						(freshQuery[0]?.metadata as VideoMetadata) || {};
+					if (
+						freshMetadata.aiGenerationStatus === "COMPLETE" ||
+						(freshMetadata.summary && freshMetadata.chapters?.length)
+					) {
+						return;
+					}
+					await db()
+						.update(videos)
+						.set({
+							metadata: {
+								...freshMetadata,
+								aiGenerationStatus: "ERROR",
+								aiGenerationClaimedAt: null,
+							},
+						})
+						.where(eq(videos.id, videoId));
+				} catch (dbErr) {
+					console.error(
+						`[Get Status] Failed to set ERROR status for ${videoId}:`,
+						dbErr,
+					);
+				}
 			});
 
 			return buildStatusResponse(
