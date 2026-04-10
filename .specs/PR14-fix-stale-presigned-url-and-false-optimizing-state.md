@@ -49,7 +49,7 @@ Track a `hasTriedRefresh` state alongside the existing `hasTriedRawFallback`. Th
 2. Second mp4 error after refresh: fall back to raw (existing behavior)
 3. Raw error: show error overlay (existing behavior)
 
-Reset `hasTriedRefresh` when a new resolved source arrives (detected by `resolvedSrc.data?.resolvedAt` changing). This allows future expirations to trigger another refresh cycle instead of being a one-shot mechanism.
+Reset `hasTriedRefresh` when a new resolved source arrives (detected by `resolvedSrc.data?.resolvedAt` changing), but only if the new source is NOT stale. If the server returns a cached/stale presigned URL after a refresh attempt, `hasTriedRefresh` remains `true`, which prevents an infinite refresh loop and allows the normal fallback-to-raw path to proceed on the next error. This allows future expirations (after a successful fresh URL is loaded) to trigger another refresh cycle instead of being a one-shot mechanism.
 
 ### 3. site.webmanifest: fix empty name fields
 
@@ -523,12 +523,13 @@ export function CapVideoPlayer({
 			currentResolvedAt !== undefined &&
 			prevResolvedAtRef.current !== undefined &&
 			currentResolvedAt !== prevResolvedAtRef.current &&
-			resolvedSrc.data?.type === "mp4"
+			resolvedSrc.data?.type === "mp4" &&
+			!isSourcePotentiallyStale(resolvedSrc.data)
 		) {
 			setHasTriedRefresh(false);
 		}
 		prevResolvedAtRef.current = currentResolvedAt;
-	}, [resolvedSrc.data?.resolvedAt, resolvedSrc.data?.type]);
+	}, [resolvedSrc.data?.resolvedAt, resolvedSrc.data?.type, resolvedSrc.data]);
 
 	useEffect(() => {
 		setPlayerDuration(fallbackDuration ?? 0);
@@ -1287,5 +1288,5 @@ export function CapVideoPlayer({
 ## Key Files
 
 - `apps/web/app/s/[videoId]/_components/playback-source.ts` - Added `isStale` boolean and `resolvedAt` timestamp to `ResolvedPlaybackSource`. Added `isPresignedUrl`, `getPresignedUrlExpiresAt`, and `computeIsStale` helpers that parse `X-Amz-Date` and `X-Amz-Expires` from presigned URLs. Changed `isSourcePotentiallyStale` to check `source.isStale` first. Replaced `appendCacheBust` URL mutation with `cache: "no-store"` fetch option to avoid invalidating presigned URL signatures.
-- `apps/web/app/s/[videoId]/_components/CapVideoPlayer.tsx` - Added `hasTriedRefresh` state with `prevResolvedAtRef` tracking so refresh resets when a new source is resolved (fixing one-shot limitation). Changed `handleError` to attempt URL refresh via query invalidation before falling back to raw when the mp4 source is stale.
+- `apps/web/app/s/[videoId]/_components/CapVideoPlayer.tsx` - Added `hasTriedRefresh` state with `prevResolvedAtRef` tracking so refresh resets when a new non-stale source is resolved (fixing one-shot limitation while preventing infinite refresh loops from cached stale URLs). Changed `handleError` to attempt URL refresh via query invalidation before falling back to raw when the mp4 source is stale.
 - `apps/web/public/site.webmanifest` - Populated empty `name` and `short_name` fields with "Cap" to fix Chrome manifest parse error.

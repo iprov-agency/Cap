@@ -232,12 +232,13 @@ export function CapVideoPlayer({
 			currentResolvedAt !== undefined &&
 			prevResolvedAtRef.current !== undefined &&
 			currentResolvedAt !== prevResolvedAtRef.current &&
-			resolvedSrc.data?.type === "mp4"
+			resolvedSrc.data?.type === "mp4" &&
+			!isSourcePotentiallyStale(resolvedSrc.data)
 		) {
 			setHasTriedRefresh(false);
 		}
 		prevResolvedAtRef.current = currentResolvedAt;
-	}, [resolvedSrc.data?.resolvedAt, resolvedSrc.data?.type]);
+	}, [resolvedSrc.data?.resolvedAt, resolvedSrc.data?.type, resolvedSrc.data]);
 
 	useEffect(() => {
 		setPlayerDuration(fallbackDuration ?? 0);
