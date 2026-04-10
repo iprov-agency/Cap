@@ -36,6 +36,7 @@ interface SummaryProps {
 	isSummaryDisabled?: boolean;
 	ownerIsPro: boolean;
 	transcriptionStatus?: string | null;
+	isOwner?: boolean;
 }
 
 const formatTime = (time: number) => {
@@ -82,6 +83,7 @@ export const Summary: React.FC<SummaryProps> = ({
 	aiGenerationEnabled = false,
 	ownerIsPro,
 	transcriptionStatus,
+	isOwner = false,
 }) => {
 	const [isRetrying, setIsRetrying] = useState(false);
 	const [retryError, setRetryError] = useState<string | null>(null);
@@ -96,13 +98,17 @@ export const Summary: React.FC<SummaryProps> = ({
 		!aiData?.chapters?.length;
 
 	const canRetry =
-		aiGenerationStatus === "ERROR" || aiGenerationStatus === "SKIPPED";
+		isOwner &&
+		(aiGenerationStatus === "ERROR" || aiGenerationStatus === "SKIPPED");
 
+	const hasCompleteAiMetadata =
+		Boolean(aiData?.summary) && Boolean(aiData?.chapters?.length);
 	const canGenerate =
+		isOwner &&
+		aiGenerationEnabled &&
 		transcriptionStatus === "COMPLETE" &&
 		!aiGenerationStatus &&
-		!aiData?.summary &&
-		!aiData?.chapters?.length;
+		!hasCompleteAiMetadata;
 
 	const handleSeek = (time: number) => {
 		if (onSeek) {
@@ -120,8 +126,14 @@ export const Summary: React.FC<SummaryProps> = ({
 			});
 
 			if (!response.ok) {
-				const data = await response.json();
-				throw new Error(data.error || "Failed to retry AI generation");
+				const errorMessage = await response
+					.json()
+					.then(
+						(data: { error?: string }) =>
+							data.error || "Failed to retry AI generation",
+					)
+					.catch(() => "Failed to retry AI generation");
+				throw new Error(errorMessage);
 			}
 
 			window.location.reload();
@@ -279,24 +291,17 @@ export const Summary: React.FC<SummaryProps> = ({
 							<h3 className="mb-2 text-lg font-medium">Chapters</h3>
 							<div className="divide-y">
 								{aiData.chapters.map((chapter) => (
-									<div
+									<button
+										type="button"
 										key={chapter.start}
-										role="button"
-										tabIndex={0}
-										className="flex items-center p-2 rounded transition-colors cursor-pointer hover:bg-gray-100"
+										className="flex items-center p-2 w-full text-left rounded transition-colors cursor-pointer hover:bg-gray-100"
 										onClick={() => handleSeek(chapter.start)}
-										onKeyDown={(e) => {
-											if (e.key === "Enter" || e.key === " ") {
-												e.preventDefault();
-												handleSeek(chapter.start);
-											}
-										}}
 									>
 										<span className="w-16 text-xs text-gray-500">
 											{formatTime(chapter.start)}
 										</span>
 										<span className="ml-2 text-sm">{chapter.title}</span>
-									</div>
+									</button>
 								))}
 							</div>
 						</div>

@@ -369,10 +369,12 @@ export async function getVideoStatus(
 		);
 	}
 
+	const hasCompleteAiMetadata =
+		Boolean(metadata.summary) && Boolean(metadata.chapters?.length);
 	const shouldTriggerAiGeneration =
 		normalizedTranscriptionStatus === "COMPLETE" &&
 		!normalizedAiGenerationStatus &&
-		!metadata.summary &&
+		!hasCompleteAiMetadata &&
 		serverEnv().GOOGLE_API_KEY;
 
 	if (shouldTriggerAiGeneration) {

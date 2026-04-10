@@ -186,6 +186,7 @@ export const Sidebar = forwardRef<{ scrollToBottom: () => void }, SidebarProps>(
 							initialAiData={aiData || undefined}
 							aiGenerationEnabled={aiGenerationEnabled}
 							transcriptionStatus={data.transcriptionStatus}
+							isOwner={isOwner}
 						/>
 					);
 				case "transcript":
