@@ -4,6 +4,8 @@ export type ResolvedPlaybackSource = {
 	url: string;
 	type: "mp4" | "raw";
 	supportsCrossOrigin: boolean;
+	resolvedAt: number;
+	isStale: boolean;
 };
 
 type ProbeResult = {
@@ -21,10 +23,69 @@ type ResolvePlaybackSourceInput = {
 	preferredSource?: "mp4" | "raw";
 };
 
-function appendCacheBust(url: string, timestamp: number): string {
-	return url.includes("?")
-		? `${url}&_t=${timestamp}`
-		: `${url}?_t=${timestamp}`;
+const PRESIGNED_URL_STALE_MS = 45 * 60 * 1000;
+
+const PRESIGNED_URL_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+
+export function isPresignedUrl(url: string): boolean {
+	try {
+		const parsed = new URL(url);
+		return parsed.searchParams.has("X-Amz-Signature");
+	} catch {
+		return false;
+	}
+}
+
+function getPresignedUrlExpiresAt(url: string): number | null {
+	try {
+		const parsed = new URL(url);
+		const amzDate = parsed.searchParams.get("X-Amz-Date");
+		const amzExpires = parsed.searchParams.get("X-Amz-Expires");
+
+		if (!amzDate || !amzExpires) {
+			return null;
+		}
+
+		const year = amzDate.substring(0, 4);
+		const month = amzDate.substring(4, 6);
+		const day = amzDate.substring(6, 8);
+		const hour = amzDate.substring(9, 11);
+		const minute = amzDate.substring(11, 13);
+		const second = amzDate.substring(13, 15);
+		const signedAtMs = Date.parse(
+			`${year}-${month}-${day}T${hour}:${minute}:${second}Z`,
+		);
+
+		if (Number.isNaN(signedAtMs)) {
+			return null;
+		}
+
+		const expiresInSeconds = Number.parseInt(amzExpires, 10);
+		if (Number.isNaN(expiresInSeconds)) {
+			return null;
+		}
+
+		return signedAtMs + expiresInSeconds * 1000;
+	} catch {
+		return null;
+	}
+}
+
+function computeIsStale(url: string, now: number): boolean {
+	const expiresAt = getPresignedUrlExpiresAt(url);
+	if (expiresAt !== null) {
+		return now >= expiresAt - PRESIGNED_URL_EXPIRY_BUFFER_MS;
+	}
+	return false;
+}
+
+export function isSourcePotentiallyStale(
+	source: ResolvedPlaybackSource | null | undefined,
+	now: number = Date.now(),
+): boolean {
+	if (!source) return false;
+	if (source.isStale) return true;
+	return now - source.resolvedAt > PRESIGNED_URL_STALE_MS;
 }
 
 function isPlayableProbeResponse(response: Response): boolean {
@@ -41,13 +102,12 @@ function isWebMContentType(contentType: string, url: string): boolean {
 async function probePlaybackSource(
 	url: string,
 	fetchImpl: typeof fetch,
-	now: () => number,
+	_now: () => number,
 ): Promise<ProbeResult | null> {
-	const requestUrl = appendCacheBust(url, now());
-
 	try {
-		const response = await fetchImpl(requestUrl, {
+		const response = await fetchImpl(url, {
 			headers: { range: "bytes=0-0" },
+			cache: "no-store",
 		});
 
 		if (!isPlayableProbeResponse(response)) {
@@ -55,7 +115,7 @@ async function probePlaybackSource(
 		}
 
 		return {
-			url: response.redirected ? response.url : requestUrl,
+			url: response.redirected ? response.url : url,
 			response,
 		};
 	} catch {
@@ -63,9 +123,7 @@ async function probePlaybackSource(
 	}
 }
 
-export function detectCrossOriginSupport(url: string): boolean {
-	// Self-hosted: CORS is configured on the R2 bucket, so all URLs support crossOrigin.
-	// The upstream check assumes S3/R2 URLs never have CORS, which is wrong for self-hosted.
+export function detectCrossOriginSupport(_url: string): boolean {
 	return true;
 }
 
@@ -105,6 +163,8 @@ export async function resolvePlaybackSource({
 	createVideoElement,
 	preferredSource = "mp4",
 }: ResolvePlaybackSourceInput): Promise<ResolvedPlaybackSource | null> {
+	const resolvedAt = now();
+
 	const resolveRaw = async (): Promise<ResolvedPlaybackSource | null> => {
 		if (!rawFallbackSrc) {
 			return null;
@@ -129,6 +189,8 @@ export async function resolvePlaybackSource({
 			type: "raw",
 			supportsCrossOrigin:
 				enableCrossOrigin && detectCrossOriginSupport(rawResult.url),
+			resolvedAt,
+			isStale: computeIsStale(rawResult.url, resolvedAt),
 		};
 	};
 
@@ -144,6 +206,8 @@ export async function resolvePlaybackSource({
 			type: "mp4",
 			supportsCrossOrigin:
 				enableCrossOrigin && detectCrossOriginSupport(mp4Result.url),
+			resolvedAt,
+			isStale: computeIsStale(mp4Result.url, resolvedAt),
 		};
 	}
 

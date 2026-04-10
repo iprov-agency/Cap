@@ -1,3 +1,294 @@
+---
+created: 2026-04-09
+system: cap
+status: approved
+target_agent: worktree
+acceptance_criteria:
+  - "Does resolvePlaybackSource return an isStale flag when the probe indicates the URL may have expired (e.g., redirected presigned URL with an old timestamp)?"
+  - "Does the video element error handler in CapVideoPlayer attempt to re-resolve the mp4 source before falling back to raw?"
+  - "Does the re-resolve attempt invalidate the React Query cache for resolvedSrc so a fresh presigned URL is fetched?"
+  - "Does the 'Optimizing video' badge only show when there is genuine upload processing activity, not due to URL expiry fallback?"
+  - "After a successful re-resolve, does the player load the fresh URL without showing the raw fallback badge?"
+  - "Does the site.webmanifest file contain valid JSON that the browser can parse without errors?"
+depends_on:
+supersedes:
+repos:
+  - Cap
+---
+
+# Fix Stale Presigned URL and False Optimizing State
+
+## Problem
+
+Video presigned URLs from R2 have a 1-hour TTL. When a user leaves a tab open longer than that, the URL expires and the `<video>` element fires an error event. The current error handler in `CapVideoPlayer.tsx` responds by falling back to the raw source, which (a) is lower quality and (b) triggers the "Optimizing video" badge even though the video is fully processed. The real problem is just that the presigned URL expired, not that the video is still being optimized.
+
+Two distinct user-facing bugs result:
+1. **Stale URL (Bug 2):** The video stops playing after ~1 hour in a background tab because the presigned URL expired. The player falls back to raw or shows an error instead of transparently refreshing.
+2. **False "Optimizing video" (Bug 3):** When the fallback to raw succeeds, the badge says "Optimizing video" even though the video is fully processed. The UI incorrectly infers optimization state from URL fetch failure.
+
+Additionally, the console shows `site.webmanifest:1 Manifest: Line: 1, column: 1, Syntax error.` on every page load because the webmanifest has empty `name` and `short_name` fields, which Chrome treats as a parse error.
+
+## Design
+
+Three changes to the video player pipeline, plus one static asset fix:
+
+### 1. playback-source.ts: presigned URL expiry detection and safe probing
+
+Add an `isStale` boolean and `resolvedAt` timestamp to `ResolvedPlaybackSource`. During probe resolution, parse the presigned URL parameters (`X-Amz-Date` and `X-Amz-Expires`) from the final URL (after redirect) to compute whether the URL has already expired or is about to expire. The `isSourcePotentiallyStale` helper checks `source.isStale` first (authoritative, based on actual URL expiry data) and falls back to a `resolvedAt` age check (45 minutes) as a safety net.
+
+Replace the `appendCacheBust` approach with `cache: "no-store"` on the fetch request. This avoids mutating the URL, which would invalidate the signature on presigned URLs. Non-presigned URLs also benefit since `cache: "no-store"` achieves the same cache-busting effect without URL mutation.
+
+Add an `isPresignedUrl` helper that checks for `X-Amz-Signature` in the URL's query parameters.
+
+### 2. CapVideoPlayer.tsx: re-resolve before falling back to raw, with repeatable refresh
+
+Change the video element's `handleError` to check whether the current mp4 source is potentially stale. If so, invalidate the `resolvedSrc` query (which triggers a fresh probe with a new presigned URL) instead of immediately falling back to raw. Only fall back to raw if the re-resolved mp4 source also fails.
+
+Track a `hasTriedRefresh` state alongside the existing `hasTriedRawFallback`. The error handling sequence becomes:
+1. First mp4 error with stale source: set `hasTriedRefresh`, invalidate query (get fresh URL)
+2. Second mp4 error after refresh: fall back to raw (existing behavior)
+3. Raw error: show error overlay (existing behavior)
+
+Reset `hasTriedRefresh` when a new resolved source arrives (detected by `resolvedSrc.data?.resolvedAt` changing), but only if the new source is NOT stale. If the server returns a cached/stale presigned URL after a refresh attempt, `hasTriedRefresh` remains `true`, which prevents an infinite refresh loop and allows the normal fallback-to-raw path to proceed on the next error. This allows future expirations (after a successful fresh URL is loaded) to trigger another refresh cycle instead of being a one-shot mechanism.
+
+### 3. site.webmanifest: fix empty name fields
+
+Populate `name` and `short_name` with "Cap" so Chrome's manifest parser accepts the file without errors.
+
+## Acceptance Criteria
+
+- [ ] Does resolvePlaybackSource return an isStale flag when the probe indicates the URL may have expired (e.g., redirected presigned URL with an old timestamp)?
+- [ ] Does the video element error handler in CapVideoPlayer attempt to re-resolve the mp4 source before falling back to raw?
+- [ ] Does the re-resolve attempt invalidate the React Query cache for resolvedSrc so a fresh presigned URL is fetched?
+- [ ] Does the "Optimizing video" badge only show when there is genuine upload processing activity, not due to URL expiry fallback?
+- [ ] After a successful re-resolve, does the player load the fresh URL without showing the raw fallback badge?
+- [ ] Does the site.webmanifest file contain valid JSON that the browser can parse without errors?
+
+## Implementation
+
+### `apps/web/app/s/[videoId]/_components/playback-source.ts`
+
+```typescript
+"use client";
+
+export type ResolvedPlaybackSource = {
+	url: string;
+	type: "mp4" | "raw";
+	supportsCrossOrigin: boolean;
+	resolvedAt: number;
+	isStale: boolean;
+};
+
+type ProbeResult = {
+	url: string;
+	response: Response;
+};
+
+type ResolvePlaybackSourceInput = {
+	videoSrc: string;
+	rawFallbackSrc?: string;
+	enableCrossOrigin?: boolean;
+	fetchImpl?: typeof fetch;
+	now?: () => number;
+	createVideoElement?: () => Pick<HTMLVideoElement, "canPlayType">;
+	preferredSource?: "mp4" | "raw";
+};
+
+const PRESIGNED_URL_STALE_MS = 45 * 60 * 1000;
+
+const PRESIGNED_URL_EXPIRY_BUFFER_MS = 5 * 60 * 1000;
+
+export function isPresignedUrl(url: string): boolean {
+	try {
+		const parsed = new URL(url);
+		return parsed.searchParams.has("X-Amz-Signature");
+	} catch {
+		return false;
+	}
+}
+
+function getPresignedUrlExpiresAt(url: string): number | null {
+	try {
+		const parsed = new URL(url);
+		const amzDate = parsed.searchParams.get("X-Amz-Date");
+		const amzExpires = parsed.searchParams.get("X-Amz-Expires");
+
+		if (!amzDate || !amzExpires) {
+			return null;
+		}
+
+		const year = amzDate.substring(0, 4);
+		const month = amzDate.substring(4, 6);
+		const day = amzDate.substring(6, 8);
+		const hour = amzDate.substring(9, 11);
+		const minute = amzDate.substring(11, 13);
+		const second = amzDate.substring(13, 15);
+		const signedAtMs = Date.parse(
+			`${year}-${month}-${day}T${hour}:${minute}:${second}Z`,
+		);
+
+		if (Number.isNaN(signedAtMs)) {
+			return null;
+		}
+
+		const expiresInSeconds = Number.parseInt(amzExpires, 10);
+		if (Number.isNaN(expiresInSeconds)) {
+			return null;
+		}
+
+		return signedAtMs + expiresInSeconds * 1000;
+	} catch {
+		return null;
+	}
+}
+
+function computeIsStale(url: string, now: number): boolean {
+	const expiresAt = getPresignedUrlExpiresAt(url);
+	if (expiresAt !== null) {
+		return now >= expiresAt - PRESIGNED_URL_EXPIRY_BUFFER_MS;
+	}
+	return false;
+}
+
+export function isSourcePotentiallyStale(
+	source: ResolvedPlaybackSource | null | undefined,
+	now: number = Date.now(),
+): boolean {
+	if (!source) return false;
+	if (source.isStale) return true;
+	return now - source.resolvedAt > PRESIGNED_URL_STALE_MS;
+}
+
+function isPlayableProbeResponse(response: Response): boolean {
+	return response.ok || response.status === 206;
+}
+
+function isWebMContentType(contentType: string, url: string): boolean {
+	return (
+		contentType.toLowerCase().includes("video/webm") ||
+		/\.webm(?:$|[?#])/i.test(url)
+	);
+}
+
+async function probePlaybackSource(
+	url: string,
+	fetchImpl: typeof fetch,
+	now: () => number,
+): Promise<ProbeResult | null> {
+	try {
+		const response = await fetchImpl(url, {
+			headers: { range: "bytes=0-0" },
+			cache: "no-store",
+		});
+
+		if (!isPlayableProbeResponse(response)) {
+			return null;
+		}
+
+		return {
+			url: response.redirected ? response.url : url,
+			response,
+		};
+	} catch {
+		return null;
+	}
+}
+
+export function detectCrossOriginSupport(url: string): boolean {
+	return true;
+}
+
+export function canPlayRawContentType(
+	contentType: string,
+	url: string,
+	createVideoElement: () => Pick<HTMLVideoElement, "canPlayType"> = () =>
+		document.createElement("video"),
+): boolean {
+	if (!isWebMContentType(contentType, url)) {
+		return true;
+	}
+
+	const video = createVideoElement();
+	return (
+		video.canPlayType(contentType) !== "" ||
+		video.canPlayType("video/webm") !== ""
+	);
+}
+
+export function shouldFallbackToRawPlaybackSource(
+	resolvedSourceType: ResolvedPlaybackSource["type"] | null | undefined,
+	rawFallbackSrc: string | undefined,
+	hasTriedRawFallback: boolean,
+): boolean {
+	return Boolean(
+		rawFallbackSrc && resolvedSourceType === "mp4" && !hasTriedRawFallback,
+	);
+}
+
+export async function resolvePlaybackSource({
+	videoSrc,
+	rawFallbackSrc,
+	enableCrossOrigin = false,
+	fetchImpl = fetch,
+	now = () => Date.now(),
+	createVideoElement,
+	preferredSource = "mp4",
+}: ResolvePlaybackSourceInput): Promise<ResolvedPlaybackSource | null> {
+	const resolvedAt = now();
+
+	const resolveRaw = async (): Promise<ResolvedPlaybackSource | null> => {
+		if (!rawFallbackSrc) {
+			return null;
+		}
+
+		const rawResult = await probePlaybackSource(rawFallbackSrc, fetchImpl, now);
+
+		if (!rawResult) {
+			return null;
+		}
+
+		const contentType = rawResult.response.headers.get("content-type") ?? "";
+
+		if (
+			!canPlayRawContentType(contentType, rawResult.url, createVideoElement)
+		) {
+			return null;
+		}
+
+		return {
+			url: rawResult.url,
+			type: "raw",
+			supportsCrossOrigin:
+				enableCrossOrigin && detectCrossOriginSupport(rawResult.url),
+			resolvedAt,
+			isStale: computeIsStale(rawResult.url, resolvedAt),
+		};
+	};
+
+	if (preferredSource === "raw") {
+		return await resolveRaw();
+	}
+
+	const mp4Result = await probePlaybackSource(videoSrc, fetchImpl, now);
+
+	if (mp4Result) {
+		return {
+			url: mp4Result.url,
+			type: "mp4",
+			supportsCrossOrigin:
+				enableCrossOrigin && detectCrossOriginSupport(mp4Result.url),
+			resolvedAt,
+			isStale: computeIsStale(mp4Result.url, resolvedAt),
+		};
+	}
+
+	return await resolveRaw();
+}
+```
+
+### `apps/web/app/s/[videoId]/_components/CapVideoPlayer.tsx`
+
+```tsx
 "use client";
 
 import { LogoSpinner } from "@cap/ui";
@@ -21,8 +312,8 @@ import {
 	useUploadProgress,
 } from "./ProgressCircle";
 import {
-	isSourcePotentiallyStale,
 	type ResolvedPlaybackSource,
+	isSourcePotentiallyStale,
 	resolvePlaybackSource,
 	shouldFallbackToRawPlaybackSource,
 } from "./playback-source";
@@ -964,3 +1255,38 @@ export function CapVideoPlayer({
 		</MediaPlayer>
 	);
 }
+```
+
+### `apps/web/public/site.webmanifest`
+
+```json
+{
+	"name": "Cap",
+	"short_name": "Cap",
+	"icons": [
+		{
+			"src": "/android-chrome-192x192.png",
+			"sizes": "192x192",
+			"type": "image/png"
+		},
+		{
+			"src": "/android-chrome-512x512.png",
+			"sizes": "512x512",
+			"type": "image/png"
+		}
+	],
+	"theme_color": "#ffffff",
+	"background_color": "#ffffff",
+	"display": "standalone"
+}
+```
+
+## Open Questions
+
+- None. The presigned URL TTL of 1 hour is a known R2/S3 default. The 5-minute expiry buffer combined with the 45-minute `resolvedAt` fallback provides reliable staleness detection from both directions.
+
+## Key Files
+
+- `apps/web/app/s/[videoId]/_components/playback-source.ts` - Added `isStale` boolean and `resolvedAt` timestamp to `ResolvedPlaybackSource`. Added `isPresignedUrl`, `getPresignedUrlExpiresAt`, and `computeIsStale` helpers that parse `X-Amz-Date` and `X-Amz-Expires` from presigned URLs. Changed `isSourcePotentiallyStale` to check `source.isStale` first. Replaced `appendCacheBust` URL mutation with `cache: "no-store"` fetch option to avoid invalidating presigned URL signatures.
+- `apps/web/app/s/[videoId]/_components/CapVideoPlayer.tsx` - Added `hasTriedRefresh` state with `prevResolvedAtRef` tracking so refresh resets when a new non-stale source is resolved (fixing one-shot limitation while preventing infinite refresh loops from cached stale URLs). Changed `handleError` to attempt URL refresh via query invalidation before falling back to raw when the mp4 source is stale.
+- `apps/web/public/site.webmanifest` - Populated empty `name` and `short_name` fields with "Cap" to fix Chrome manifest parse error.
