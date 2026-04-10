@@ -164,6 +164,20 @@ export async function POST(request: NextRequest) {
 			await db()
 				.delete(videoUploads)
 				.where(eq(videoUploads.videoId, payload.videoId as Video.VideoId));
+
+			if (currentVideo?.ownerId) {
+				const { transcribeVideo } = await import("@/lib/transcribe");
+				transcribeVideo(
+					payload.videoId as Video.VideoId,
+					currentVideo.ownerId,
+				).catch((err) => {
+					console.error(
+						"[media-server-webhook] Transcription trigger failed for %s:",
+						payload.videoId,
+						err,
+					);
+				});
+			}
 		} else if (dbPhase === "error") {
 			await db()
 				.update(videoUploads)
