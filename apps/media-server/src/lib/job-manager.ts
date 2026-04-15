@@ -33,6 +33,8 @@ export interface VideoMetadata {
 	audioCodec: string | null;
 	audioChannels: number | null;
 	sampleRate: number | null;
+	audioStreamCount?: number;
+	preferredAudioStreamIndex?: number | null;
 	bitrate: number;
 	fileSize: number;
 }

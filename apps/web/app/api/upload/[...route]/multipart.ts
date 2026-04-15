@@ -29,6 +29,7 @@ import {
 	getMultipartFileKey,
 	getSubpath,
 	isRawRecorderUpload,
+	shouldRemuxUploadedResult,
 } from "./multipart-utils";
 
 export const app = new Hono().use(withAuth);
@@ -624,7 +625,7 @@ app.post(
 					);
 
 					const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
-					if (video.source.type === "webMP4" && mediaServerUrl) {
+					if (shouldRemuxUploadedResult(subpath) && mediaServerUrl) {
 						const inputUrl = yield* bucket.getInternalSignedObjectUrl(fileKey);
 						const outputPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
 							fileKey,

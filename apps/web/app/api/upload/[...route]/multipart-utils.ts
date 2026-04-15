@@ -32,3 +32,6 @@ export const getMultipartFileKey = (
 
 export const isRawRecorderUpload = (subpath: string) =>
 	subpath.startsWith("raw-upload.");
+
+export const shouldRemuxUploadedResult = (subpath: string) =>
+	subpath === "result.mp4" && !isRawRecorderUpload(subpath);

@@ -437,6 +437,44 @@ function needsAudioTranscode(metadata: VideoMetadata): boolean {
 	return metadata.audioCodec !== "aac";
 }
 
+function getPreferredAudioMapArgs(metadata: VideoMetadata): string[] {
+	try {
+		if (!metadata.audioCodec) {
+			return [];
+		}
+
+		const audioStreamCount = metadata.audioStreamCount ?? 0;
+		if (audioStreamCount <= 1) {
+			return [];
+		}
+
+		if (
+			metadata.preferredAudioStreamIndex === null ||
+			metadata.preferredAudioStreamIndex === undefined ||
+			metadata.preferredAudioStreamIndex < 0 ||
+			metadata.preferredAudioStreamIndex >= audioStreamCount
+		) {
+			console.warn(
+				"[processVideo] Multiple audio streams detected but no valid preferred audio stream index was available; falling back to FFmpeg default stream selection.",
+			);
+			return [];
+		}
+
+		return [
+			"-map",
+			"0:v:0",
+			"-map",
+			`0:a:${metadata.preferredAudioStreamIndex}`,
+		];
+	} catch (error) {
+		console.warn(
+			"[processVideo] Failed to select preferred audio stream; falling back to FFmpeg default stream selection.",
+			error,
+		);
+		return [];
+	}
+}
+
 export async function downloadVideoToTemp(
 	videoUrl: string,
 	inputExtension?: string,
@@ -754,6 +792,7 @@ export async function processVideo(
 		metadata.duration,
 		opts.timeoutMs,
 	);
+	const preferredAudioMapArgs = getPreferredAudioMapArgs(metadata);
 
 	const ffmpegArgs: string[] = [
 		"ffmpeg",
@@ -762,6 +801,7 @@ export async function processVideo(
 		...extraInputArgs,
 		"-i",
 		inputPath,
+		...preferredAudioMapArgs,
 	];
 
 	if (videoTranscode) {

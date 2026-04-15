@@ -19,6 +19,8 @@ describe("ffprobe integration tests", () => {
 			expect(metadata).toHaveProperty("audioCodec");
 			expect(metadata).toHaveProperty("audioChannels");
 			expect(metadata).toHaveProperty("sampleRate");
+			expect(metadata).toHaveProperty("audioStreamCount");
+			expect(metadata).toHaveProperty("preferredAudioStreamIndex");
 			expect(metadata).toHaveProperty("bitrate");
 			expect(metadata).toHaveProperty("fileSize");
 
@@ -28,6 +30,8 @@ describe("ffprobe integration tests", () => {
 			expect(metadata.fps).toBeGreaterThan(0);
 			expect(metadata.videoCodec).toBeTruthy();
 			expect(metadata.audioCodec).not.toBeNull();
+			expect(metadata.audioStreamCount).toBe(1);
+			expect(metadata.preferredAudioStreamIndex).toBeNull();
 		});
 
 		test("extracts metadata from video without audio", async () => {
@@ -41,6 +45,8 @@ describe("ffprobe integration tests", () => {
 			expect(metadata.audioCodec).toBeNull();
 			expect(metadata.audioChannels).toBeNull();
 			expect(metadata.sampleRate).toBeNull();
+			expect(metadata.audioStreamCount).toBe(0);
+			expect(metadata.preferredAudioStreamIndex).toBeNull();
 		});
 
 		test("throws error for non-existent video", async () => {
