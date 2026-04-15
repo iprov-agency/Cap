@@ -92,8 +92,11 @@ interface FFprobeOutput {
 		avg_frame_rate?: string;
 		channels?: number;
 		sample_rate?: string;
+		bit_rate?: string;
 	}>;
 }
+
+type FFprobeStream = NonNullable<FFprobeOutput["streams"]>[number];
 
 function parseFrameRate(rateStr: string | undefined): number {
 	if (!rateStr) return 0;
@@ -104,6 +107,114 @@ function parseFrameRate(rateStr: string | undefined): number {
 		if (den !== 0) return num / den;
 	}
 	return Number.parseFloat(rateStr) || 0;
+}
+
+function parseBitRate(bitRate: string | undefined): number {
+	if (!bitRate) return 0;
+	const parsed = Number.parseInt(bitRate, 10);
+	return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function getAudioStreams(streams?: FFprobeOutput["streams"]): FFprobeStream[] {
+	return (
+		streams?.filter(
+			(stream): stream is FFprobeStream => stream.codec_type === "audio",
+		) ?? []
+	);
+}
+
+function getPreferredAudioStream(
+	streams?: FFprobeOutput["streams"],
+): FFprobeStream | undefined {
+	const audioStreams = getAudioStreams(streams);
+	if (audioStreams.length === 0) {
+		return undefined;
+	}
+
+	let preferredStream = audioStreams[0];
+	let preferredBitRate = parseBitRate(preferredStream.bit_rate);
+
+	for (const stream of audioStreams.slice(1)) {
+		const streamBitRate = parseBitRate(stream.bit_rate);
+		if (streamBitRate > preferredBitRate) {
+			preferredStream = stream;
+			preferredBitRate = streamBitRate;
+		}
+	}
+
+	return preferredStream;
+}
+
+function getPreferredAudioStreamIndex(
+	streams?: FFprobeOutput["streams"],
+): number | null {
+	const audioStreams = getAudioStreams(streams);
+	if (audioStreams.length <= 1) {
+		return null;
+	}
+
+	let preferredIndex = 0;
+	let preferredBitRate = parseBitRate(audioStreams[0]?.bit_rate);
+
+	for (const [index, stream] of audioStreams.entries()) {
+		const streamBitRate = parseBitRate(stream.bit_rate);
+		if (streamBitRate > preferredBitRate) {
+			preferredIndex = index;
+			preferredBitRate = streamBitRate;
+		}
+	}
+
+	return preferredIndex;
+}
+
+export async function probePreferredAudioStreamIndex(
+	videoUrl: string,
+): Promise<number | null> {
+	if (!canAcceptNewProbeProcess()) {
+		throw new Error("Server is busy, please try again later");
+	}
+
+	activeProbeProcesses++;
+
+	const proc = registerSubprocess(
+		spawn({
+			cmd: [
+				"ffprobe",
+				"-v",
+				"quiet",
+				"-print_format",
+				"json",
+				"-show_streams",
+				videoUrl,
+			],
+			stdout: "pipe",
+			stderr: "ignore",
+		}),
+	);
+
+	try {
+		return await withTimeout(
+			(async () => {
+				const stdoutText = await readStreamToString(
+					proc.stdout as ReadableStream<Uint8Array>,
+					MAX_OUTPUT_BYTES,
+				);
+
+				const exitCode = await proc.exited;
+				if (exitCode !== 0) {
+					throw new Error(`ffprobe exited with code ${exitCode}`);
+				}
+
+				const data: FFprobeOutput = JSON.parse(stdoutText);
+				return getPreferredAudioStreamIndex(data.streams);
+			})(),
+			PROBE_TIMEOUT_MS,
+			() => terminateProcess(proc),
+		);
+	} finally {
+		activeProbeProcesses--;
+		await terminateProcess(proc);
+	}
 }
 
 export async function probeVideo(videoUrl: string): Promise<VideoMetadata> {
@@ -158,7 +269,7 @@ export async function probeVideo(videoUrl: string): Promise<VideoMetadata> {
 				}
 
 				const videoStream = data.streams?.find((s) => s.codec_type === "video");
-				const audioStream = data.streams?.find((s) => s.codec_type === "audio");
+				const audioStream = getPreferredAudioStream(data.streams);
 
 				if (!videoStream) {
 					console.error(
@@ -249,7 +360,7 @@ export async function probeVideoFile(filePath: string): Promise<VideoMetadata> {
 				);
 
 				const videoStream = data.streams?.find((s) => s.codec_type === "video");
-				const audioStream = data.streams?.find((s) => s.codec_type === "audio");
+				const audioStream = getPreferredAudioStream(data.streams);
 
 				if (!videoStream) {
 					throw new Error("No video stream found");

@@ -1,4 +1,5 @@
 import { type Subprocess, spawn } from "bun";
+import { probePreferredAudioStreamIndex } from "./ffprobe";
 import { registerSubprocess, terminateProcess } from "./subprocess";
 
 export interface AudioExtractionOptions {
@@ -106,6 +107,52 @@ async function readStreamWithLimit(
 
 const MAX_STDERR_BYTES = 64 * 1024;
 
+function buildExtractAudioArgs(
+	videoUrl: string,
+	codec: string,
+	bitrate: string,
+	mapArgs: string[] = [],
+): string[] {
+	return [
+		"ffmpeg",
+		"-i",
+		videoUrl,
+		...mapArgs,
+		"-vn",
+		"-acodec",
+		codec,
+		"-b:a",
+		bitrate,
+		"-f",
+		"mp3",
+		"pipe:1",
+	];
+}
+
+async function getPreferredAudioMapArgs(videoUrl: string): Promise<string[]> {
+	try {
+		const preferredAudioStreamIndex =
+			await probePreferredAudioStreamIndex(videoUrl);
+
+		if (preferredAudioStreamIndex === null) {
+			return [];
+		}
+
+		console.log(
+			`[ffmpeg] Selecting audio stream 0:a:${preferredAudioStreamIndex} for ${videoUrl.substring(0, 100)}...`,
+		);
+
+		return ["-map", `0:a:${preferredAudioStreamIndex}`];
+	} catch (error) {
+		console.warn(
+			`[ffmpeg] Failed to probe audio streams for ${videoUrl.substring(0, 100)}..., falling back to default selection: ${
+				error instanceof Error ? error.message : String(error)
+			}`,
+		);
+		return [];
+	}
+}
+
 export async function checkHasAudioTrack(videoUrl: string): Promise<boolean> {
 	if (!canAcceptNewProcess()) {
 		throw new Error("Server is busy, please try again later");
@@ -174,20 +221,13 @@ export async function extractAudio(
 	activeProcesses++;
 
 	const opts = { ...DEFAULT_OPTIONS, ...options };
-
-	const ffmpegArgs = [
-		"ffmpeg",
-		"-i",
+	const mapArgs = await getPreferredAudioMapArgs(videoUrl);
+	const ffmpegArgs = buildExtractAudioArgs(
 		videoUrl,
-		"-vn",
-		"-acodec",
 		opts.codec,
-		"-b:a",
 		opts.bitrate,
-		"-f",
-		"mp3",
-		"pipe:1",
-	];
+		mapArgs,
+	);
 
 	const proc = registerSubprocess(
 		spawn({
@@ -273,34 +313,7 @@ export function extractAudioStream(
 
 	const opts = { ...DEFAULT_OPTIONS, ...options };
 	const timeout = options.timeoutMs ?? EXTRACT_TIMEOUT_MS;
-
-	let proc: Subprocess;
-	try {
-		const ffmpegArgs = [
-			"ffmpeg",
-			"-i",
-			videoUrl,
-			"-vn",
-			"-acodec",
-			opts.codec,
-			"-b:a",
-			opts.bitrate,
-			"-f",
-			"mp3",
-			"pipe:1",
-		];
-
-		proc = registerSubprocess(
-			spawn({
-				cmd: ffmpegArgs,
-				stdout: "pipe",
-				stderr: "pipe",
-			}),
-		);
-	} catch (err) {
-		activeProcesses--;
-		throw err;
-	}
+	let proc: Subprocess | null = null;
 
 	let timeoutId: ReturnType<typeof setTimeout> | undefined;
 	let cleaned = false;
@@ -318,29 +331,60 @@ export function extractAudioStream(
 			reader = null;
 		}
 		activeProcesses--;
-		void terminateProcess(proc);
-	};
-
-	timeoutId = setTimeout(() => {
-		console.error("[ffmpeg] Stream extraction timed out");
-		cleanup();
-	}, timeout);
-
-	drainStream(proc.stderr as ReadableStream<Uint8Array>);
-
-	proc.exited.then((code) => {
-		if (code !== 0 && !cleaned) {
-			console.error(`[ffmpeg] Stream extraction exited with code ${code}`);
+		if (proc) {
+			void terminateProcess(proc);
+			proc = null;
 		}
-		cleanup();
-	});
-
-	const originalStream = proc.stdout as ReadableStream<Uint8Array>;
+	};
 
 	const wrappedStream = new ReadableStream<Uint8Array>(
 		{
-			start() {
-				reader = originalStream.getReader();
+			async start(controller) {
+				try {
+					const mapArgs = await getPreferredAudioMapArgs(videoUrl);
+					if (cleaned) {
+						return;
+					}
+
+					const ffmpegArgs = buildExtractAudioArgs(
+						videoUrl,
+						opts.codec,
+						opts.bitrate,
+						mapArgs,
+					);
+
+					proc = registerSubprocess(
+						spawn({
+							cmd: ffmpegArgs,
+							stdout: "pipe",
+							stderr: "pipe",
+						}),
+					);
+				} catch (err) {
+					cleanup();
+					controller.error(err);
+					return;
+				}
+
+				if (cleaned || !proc) {
+					return;
+				}
+
+				timeoutId = setTimeout(() => {
+					console.error("[ffmpeg] Stream extraction timed out");
+					cleanup();
+				}, timeout);
+
+				drainStream(proc.stderr as ReadableStream<Uint8Array>);
+
+				proc.exited.then((code) => {
+					if (code !== 0 && !cleaned) {
+						console.error(`[ffmpeg] Stream extraction exited with code ${code}`);
+					}
+					cleanup();
+				});
+
+				reader = (proc.stdout as ReadableStream<Uint8Array>).getReader();
 			},
 			async pull(controller) {
 				if (!reader || cleaned) {
