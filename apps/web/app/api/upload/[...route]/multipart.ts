@@ -38,6 +38,18 @@ const runPromiseAnyEnv = runPromise as <A, E>(
 	effect: Effect.Effect<A, E, unknown>,
 ) => Promise<A>;
 
+type MultipartThumbnailFallbackParams = {
+	bucketId: Option.Option<S3Bucket.S3BucketId>;
+	fileKey: string;
+	userId: string;
+	videoId: Video.VideoId;
+};
+
+type MultipartThumbnailFallbackPayload = {
+	thumbnailPresignedUrl: string;
+	videoUrl: string;
+};
+
 function isS3MissingObjectError(error: unknown): boolean {
 	if (!error || typeof error !== "object" || !("cause" in error)) {
 		return false;
@@ -81,23 +93,11 @@ function createMediaServerJsonHeaders(
 	return headers;
 }
 
-async function triggerMultipartThumbnailFallback(params: {
-	bucketId: Option.Option<S3Bucket.S3BucketId>;
-	fileKey: string;
-	userId: string;
-	videoId: Video.VideoId;
-}) {
-	const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
-	const mediaServerSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET || undefined;
-	if (!mediaServerUrl) {
-		console.warn(
-			`[multipart] MEDIA_SERVER_URL is not configured; skipping thumbnail fallback for ${params.videoId}`,
-		);
-		return;
-	}
-
+async function getMultipartThumbnailFallbackPayload(
+	params: MultipartThumbnailFallbackParams,
+): Promise<MultipartThumbnailFallbackPayload | null> {
 	const screenshotKey = `${params.userId}/${params.videoId}/screenshot/screen-capture.jpg`;
-	const fallbackPayload = await Effect.gen(function* () {
+	return Effect.gen(function* () {
 		const [bucket] = yield* S3Buckets.getBucketAccess(params.bucketId);
 
 		const screenshotExists = yield* bucket.headObject(screenshotKey).pipe(
@@ -126,6 +126,21 @@ async function triggerMultipartThumbnailFallback(params: {
 			videoUrl,
 		};
 	}).pipe(runPromiseAnyEnv);
+}
+
+async function triggerMultipartThumbnailFallback(
+	params: MultipartThumbnailFallbackParams,
+) {
+	const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
+	const mediaServerSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET || undefined;
+	if (!mediaServerUrl) {
+		console.warn(
+			`[multipart] MEDIA_SERVER_URL is not configured; skipping thumbnail fallback for ${params.videoId}`,
+		);
+		return;
+	}
+
+	const fallbackPayload = await getMultipartThumbnailFallbackPayload(params);
 
 	if (!fallbackPayload) {
 		return;
@@ -413,12 +428,7 @@ app.post(
 		let uploadSucceeded = false;
 		let isRawUpload = false;
 		let uploadBucketId: string | null = null;
-		let thumbnailFallbackParams: {
-			bucketId: Option.Option<S3Bucket.S3BucketId>;
-			fileKey: string;
-			userId: string;
-			videoId: Video.VideoId;
-		} | null = null;
+		let thumbnailFallbackParams: MultipartThumbnailFallbackParams | null = null;
 
 		const response = await Effect.gen(function* () {
 			const repo = yield* VideosRepo;
@@ -624,8 +634,20 @@ app.post(
 						}),
 					);
 
+					const resultThumbnailFallbackParams =
+						subpath === "result.mp4"
+							? {
+									bucketId: video.bucketId,
+									fileKey,
+									userId: user.id,
+									videoId,
+								}
+							: null;
+
 					const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
-					if (shouldRemuxUploadedResult(subpath) && mediaServerUrl) {
+					const shouldRemuxResult = shouldRemuxUploadedResult(subpath);
+
+					if (shouldRemuxResult && mediaServerUrl) {
 						const inputUrl = yield* bucket.getInternalSignedObjectUrl(fileKey);
 						const outputPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
 							fileKey,
@@ -639,7 +661,31 @@ app.post(
 							},
 						);
 
-						yield* Effect.tryPromise({
+						let thumbnailFallbackPayload: MultipartThumbnailFallbackPayload | null =
+							null;
+
+						if (resultThumbnailFallbackParams) {
+							thumbnailFallbackPayload = yield* Effect.tryPromise({
+								try: () =>
+									getMultipartThumbnailFallbackPayload(
+										resultThumbnailFallbackParams,
+									),
+								catch: (cause) =>
+									cause instanceof Error
+										? cause
+										: new Error(String(cause)),
+							}).pipe(
+								Effect.catchAll((error) => {
+									console.warn(
+										`[multipart] Failed to prepare remux thumbnail fallback for ${videoId}:`,
+										error,
+									);
+									return Effect.succeed(null);
+								}),
+							);
+						}
+
+						const remuxQueued = yield* Effect.tryPromise({
 							try: async () => {
 								const response = await fetch(
 									`${mediaServerUrl}/video/process`,
@@ -653,6 +699,8 @@ app.post(
 											userId: user.id,
 											videoUrl: inputUrl,
 											outputPresignedUrl,
+											thumbnailPresignedUrl:
+												thumbnailFallbackPayload?.thumbnailPresignedUrl,
 											remuxOnly: true,
 										}),
 									},
@@ -664,15 +712,21 @@ app.post(
 										`Media server remux failed: ${response.status} ${errorText}`,
 									);
 								}
+
+								return true;
 							},
 							catch: (cause) =>
 								cause instanceof Error ? cause : new Error(String(cause)),
 						}).pipe(
 							Effect.catchAll((error) => {
 								console.error("Failed to queue faststart remux:", error);
-								return Effect.succeed(null);
+								return Effect.succeed(false);
 							}),
 						);
+
+						if (!remuxQueued) {
+							thumbnailFallbackParams = resultThumbnailFallbackParams;
+						}
 					}
 
 					if (Option.isNone(customBucket)) {
@@ -713,13 +767,8 @@ app.post(
 						}
 					}
 
-					if (subpath === "result.mp4") {
-						thumbnailFallbackParams = {
-							bucketId: video.bucketId,
-							fileKey,
-							userId: user.id,
-							videoId,
-						};
+					if (resultThumbnailFallbackParams && !shouldRemuxResult) {
+						thumbnailFallbackParams = resultThumbnailFallbackParams;
 					}
 
 					uploadSucceeded = true;
