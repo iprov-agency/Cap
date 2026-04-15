@@ -132,6 +132,8 @@ export async function generateVideoOgImage(videoId: Video.VideoId) {
 				</div>
 				{screenshotUrl && (
 					<img
+						width={1020}
+						height={535.5}
 						style={{
 							width: "100%",
 							height: "100%",

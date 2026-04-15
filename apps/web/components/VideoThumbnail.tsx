@@ -88,10 +88,14 @@ export const VideoThumbnail: React.FC<VideoThumbnailProps> = memo(
 			}
 		}, [setImageStatus]);
 
+		const showNoThumbnail =
+			!hasActiveUpload && thumbnailUrl.isSuccess && !thumbnailUrl.data;
 		const showError =
-			!hasActiveUpload && (thumbnailUrl.isError || imageStatus === "error");
+			showNoThumbnail ||
+			(!hasActiveUpload && (thumbnailUrl.isError || imageStatus === "error"));
 		const showLoading =
-			hasActiveUpload || thumbnailUrl.isPending || imageStatus === "loading";
+			!showError &&
+			(hasActiveUpload || thumbnailUrl.isPending || imageStatus === "loading");
 
 		return (
 			<div

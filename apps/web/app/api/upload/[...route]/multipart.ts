@@ -14,7 +14,7 @@ import {
 	VideosPolicy,
 	VideosRepo,
 } from "@cap/web-backend";
-import { Policy, Video } from "@cap/web-domain";
+import { Policy, type S3Bucket, Video } from "@cap/web-domain";
 import { zValidator } from "@hono/zod-validator";
 import { and, eq } from "drizzle-orm";
 import { Effect, Option, Schedule } from "effect";
@@ -36,6 +36,137 @@ export const app = new Hono().use(withAuth);
 const runPromiseAnyEnv = runPromise as <A, E>(
 	effect: Effect.Effect<A, E, unknown>,
 ) => Promise<A>;
+
+function isS3MissingObjectError(error: unknown): boolean {
+	if (!error || typeof error !== "object" || !("cause" in error)) {
+		return false;
+	}
+
+	const underlying = (error as { cause: unknown }).cause;
+	if (!underlying || typeof underlying !== "object") {
+		return false;
+	}
+
+	if ("name" in underlying) {
+		const name = (underlying as { name?: unknown }).name;
+		if (name === "NotFound" || name === "NoSuchKey") {
+			return true;
+		}
+	}
+
+	if ("$metadata" in underlying) {
+		const statusCode = (
+			underlying as {
+				$metadata?: { httpStatusCode?: unknown };
+			}
+		).$metadata?.httpStatusCode;
+		return statusCode === 404;
+	}
+
+	return false;
+}
+
+function createMediaServerJsonHeaders(
+	mediaServerSecret: string | undefined,
+): Record<string, string> {
+	const headers: Record<string, string> = {
+		"Content-Type": "application/json",
+	};
+
+	if (mediaServerSecret) {
+		headers["x-media-server-secret"] = mediaServerSecret;
+	}
+
+	return headers;
+}
+
+async function triggerMultipartThumbnailFallback(params: {
+	bucketId: Option.Option<S3Bucket.S3BucketId>;
+	fileKey: string;
+	userId: string;
+	videoId: Video.VideoId;
+}) {
+	const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
+	const mediaServerSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET || undefined;
+	if (!mediaServerUrl) {
+		console.warn(
+			`[multipart] MEDIA_SERVER_URL is not configured; skipping thumbnail fallback for ${params.videoId}`,
+		);
+		return;
+	}
+
+	const screenshotKey = `${params.userId}/${params.videoId}/screenshot/screen-capture.jpg`;
+	const fallbackPayload = await Effect.gen(function* () {
+		const [bucket] = yield* S3Buckets.getBucketAccess(params.bucketId);
+
+		const screenshotExists = yield* bucket.headObject(screenshotKey).pipe(
+			Effect.as(true),
+			Effect.catchAll((error) =>
+				isS3MissingObjectError(error)
+					? Effect.succeed(false)
+					: Effect.fail(error),
+			),
+		);
+
+		if (screenshotExists) {
+			return null;
+		}
+
+		const videoUrl = yield* bucket.getInternalSignedObjectUrl(params.fileKey);
+		const thumbnailPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
+			screenshotKey,
+			{
+				ContentType: "image/jpeg",
+			},
+		);
+
+		return {
+			thumbnailPresignedUrl,
+			videoUrl,
+		};
+	}).pipe(runPromiseAnyEnv);
+
+	if (!fallbackPayload) {
+		return;
+	}
+
+	// Use the dedicated thumbnail endpoint so the fallback never rewrites result.mp4.
+	const response = await fetch(`${mediaServerUrl}/video/thumbnail`, {
+		method: "POST",
+		headers: createMediaServerJsonHeaders(mediaServerSecret),
+		body: JSON.stringify({
+			videoUrl: fallbackPayload.videoUrl,
+		}),
+	});
+
+	if (!response.ok) {
+		const errorText = await response.text().catch(() => "");
+		throw new Error(
+			`Media server thumbnail fallback failed: ${response.status} ${errorText}`,
+		);
+	}
+
+	const thumbnailBuffer = await response.arrayBuffer();
+	if (thumbnailBuffer.byteLength === 0) {
+		throw new Error("Media server thumbnail fallback returned an empty image");
+	}
+
+	const uploadResponse = await fetch(fallbackPayload.thumbnailPresignedUrl, {
+		method: "PUT",
+		headers: {
+			"Content-Type": "image/jpeg",
+			"Content-Length": thumbnailBuffer.byteLength.toString(),
+		},
+		body: new Uint8Array(thumbnailBuffer),
+	});
+
+	if (!uploadResponse.ok) {
+		const errorText = await uploadResponse.text().catch(() => "");
+		throw new Error(
+			`Thumbnail fallback upload failed: ${uploadResponse.status} ${errorText}`,
+		);
+	}
+}
 
 const abortRequestSchema = z
 	.object({
@@ -281,6 +412,12 @@ app.post(
 		let uploadSucceeded = false;
 		let isRawUpload = false;
 		let uploadBucketId: string | null = null;
+		let thumbnailFallbackParams: {
+			bucketId: Option.Option<S3Bucket.S3BucketId>;
+			fileKey: string;
+			userId: string;
+			videoId: Video.VideoId;
+		} | null = null;
 
 		const response = await Effect.gen(function* () {
 			const repo = yield* VideosRepo;
@@ -507,7 +644,9 @@ app.post(
 									`${mediaServerUrl}/video/process`,
 									{
 										method: "POST",
-										headers: { "Content-Type": "application/json" },
+										headers: createMediaServerJsonHeaders(
+											serverEnv().MEDIA_SERVER_WEBHOOK_SECRET || undefined,
+										),
 										body: JSON.stringify({
 											videoId,
 											userId: user.id,
@@ -573,6 +712,15 @@ app.post(
 						}
 					}
 
+					if (subpath === "result.mp4") {
+						thumbnailFallbackParams = {
+							bucketId: video.bucketId,
+							fileKey,
+							userId: user.id,
+							videoId,
+						};
+					}
+
 					uploadSucceeded = true;
 
 					return c.json({
@@ -623,6 +771,18 @@ app.post(
 			provideOptionalAuth,
 			runPromiseAnyEnv,
 		);
+
+		const fallbackParams = thumbnailFallbackParams;
+		if (fallbackParams) {
+			triggerMultipartThumbnailFallback(fallbackParams).catch(
+				(error) => {
+					console.warn(
+						`[multipart] Thumbnail fallback trigger failed for ${fallbackParams.videoId}:`,
+						error,
+					);
+				},
+			);
+		}
 
 		if (videoIdRaw && uploadSucceeded && !isRawUpload) {
 			transcribeVideo(Video.VideoId.make(videoIdRaw), user.id).catch((err) => {
