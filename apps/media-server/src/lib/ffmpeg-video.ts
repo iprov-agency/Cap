@@ -437,15 +437,34 @@ function needsAudioTranscode(metadata: VideoMetadata): boolean {
 	return metadata.audioCodec !== "aac";
 }
 
-function getPreferredAudioMapArgs(metadata: VideoMetadata): string[] {
+interface AudioSelectionPlan {
+	args: string[];
+	stripAudio: boolean;
+}
+
+function buildStripAudioSelectionPlan(warning: string): AudioSelectionPlan {
+	console.warn(warning);
+	return {
+		args: ["-map", "0:v:0", "-an"],
+		stripAudio: true,
+	};
+}
+
+function getPreferredAudioMapArgs(metadata: VideoMetadata): AudioSelectionPlan {
+	const audioStreamCount = metadata.audioStreamCount ?? 0;
+
 	try {
-		if (!metadata.audioCodec) {
-			return [];
+		if (audioStreamCount <= 1) {
+			return {
+				args: [],
+				stripAudio: false,
+			};
 		}
 
-		const audioStreamCount = metadata.audioStreamCount ?? 0;
-		if (audioStreamCount <= 1) {
-			return [];
+		if (!metadata.audioCodec) {
+			return buildStripAudioSelectionPlan(
+				`[processVideo] Multiple audio streams detected (${audioStreamCount}) but no audio codec metadata was available; stripping audio instead of guessing which track to keep.`,
+			);
 		}
 
 		if (
@@ -454,24 +473,36 @@ function getPreferredAudioMapArgs(metadata: VideoMetadata): string[] {
 			metadata.preferredAudioStreamIndex < 0 ||
 			metadata.preferredAudioStreamIndex >= audioStreamCount
 		) {
-			console.warn(
-				"[processVideo] Multiple audio streams detected but no valid preferred audio stream index was available; falling back to FFmpeg default stream selection.",
+			return buildStripAudioSelectionPlan(
+				`[processVideo] Multiple audio streams detected (${audioStreamCount}) but no valid preferred audio stream index was available (${metadata.preferredAudioStreamIndex}); stripping audio instead of guessing which track to keep.`,
 			);
-			return [];
 		}
 
-		return [
-			"-map",
-			"0:v:0",
-			"-map",
-			`0:a:${metadata.preferredAudioStreamIndex}`,
-		];
+		return {
+			args: [
+				"-map",
+				"0:v:0",
+				"-map",
+				`0:a:${metadata.preferredAudioStreamIndex}`,
+			],
+			stripAudio: false,
+		};
 	} catch (error) {
 		console.warn(
-			"[processVideo] Failed to select preferred audio stream; falling back to FFmpeg default stream selection.",
+			audioStreamCount > 1
+				? "[processVideo] Failed to select a preferred audio stream from multiple tracks; stripping audio instead of guessing which track to keep."
+				: "[processVideo] Failed to select preferred audio stream.",
 			error,
 		);
-		return [];
+		return audioStreamCount > 1
+			? {
+					args: ["-map", "0:v:0", "-an"],
+					stripAudio: true,
+				}
+			: {
+					args: [],
+					stripAudio: false,
+				};
 	}
 }
 
@@ -792,7 +823,7 @@ export async function processVideo(
 		metadata.duration,
 		opts.timeoutMs,
 	);
-	const preferredAudioMapArgs = getPreferredAudioMapArgs(metadata);
+	const preferredAudioSelection = getPreferredAudioMapArgs(metadata);
 
 	const ffmpegArgs: string[] = [
 		"ffmpeg",
@@ -801,7 +832,7 @@ export async function processVideo(
 		...extraInputArgs,
 		"-i",
 		inputPath,
-		...preferredAudioMapArgs,
+		...preferredAudioSelection.args,
 	];
 
 	if (videoTranscode) {
@@ -819,7 +850,9 @@ export async function processVideo(
 		ffmpegArgs.push("-c:v", "copy");
 	}
 
-	if (metadata.audioCodec) {
+	if (preferredAudioSelection.stripAudio) {
+		// Audio is already explicitly disabled in the input mapping args.
+	} else if (metadata.audioCodec) {
 		if (audioTranscode) {
 			ffmpegArgs.push("-c:a", "aac", "-b:a", opts.audioBitrate);
 		} else {

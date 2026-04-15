@@ -17,6 +17,30 @@ const TEST_VIDEO_NO_AUDIO = join(FIXTURES_DIR, "test-no-audio.mp4");
 
 const tempFiles: string[] = [];
 
+async function withCapturedWarnings<T>(
+	callback: () => Promise<T> | T,
+): Promise<{ result: T; warnings: string[] }> {
+	const originalWarn = console.warn;
+	const warnings: string[] = [];
+
+	console.warn = (...args: unknown[]) => {
+		warnings.push(
+			args
+				.map((arg) => (arg instanceof Error ? arg.message : String(arg)))
+				.join(" "),
+		);
+	};
+
+	try {
+		return {
+			result: await callback(),
+			warnings,
+		};
+	} finally {
+		console.warn = originalWarn;
+	}
+}
+
 function createDualAudioFixture(): string {
 	const dualAudioPath = join(
 		FIXTURES_DIR,
@@ -43,9 +67,9 @@ function createDualAudioFixture(): string {
 		"-c:a",
 		"aac",
 		"-b:a:0",
-		"2k",
-		"-b:a:1",
 		"64k",
+		"-b:a:1",
+		"2k",
 		"-shortest",
 		dualAudioPath,
 	]);
@@ -232,8 +256,8 @@ describe("processVideo integration tests", () => {
 		const metadata = await probeVideo(`file://${dualAudioPath}`);
 
 		expect(metadata.audioStreamCount).toBe(2);
-		expect(metadata.preferredAudioStreamIndex).toBe(1);
-		expect(metadata.audioChannels).toBe(1);
+		expect(metadata.preferredAudioStreamIndex).toBe(0);
+		expect(metadata.audioChannels).toBe(2);
 
 		const tempFile = await processVideo(dualAudioPath, metadata, {
 			remuxOnly: true,
@@ -242,8 +266,74 @@ describe("processVideo integration tests", () => {
 
 		const outputMetadata = await probeVideo(`file://${tempFile.path}`);
 		expect(outputMetadata.audioStreamCount).toBe(1);
-		expect(outputMetadata.audioChannels).toBe(1);
+		expect(outputMetadata.audioChannels).toBe(2);
 		expect(outputMetadata.videoCodec).toBe("h264");
+
+		await tempFile.cleanup();
+	}, 60000);
+
+	test("remuxOnly strips audio when multiple tracks exist but no preferred stream can be determined", async () => {
+		const dualAudioPath = createDualAudioFixture();
+		const metadata = await probeVideo(`file://${dualAudioPath}`);
+		const metadataWithoutPreferredStream = {
+			...metadata,
+			preferredAudioStreamIndex: null,
+		};
+
+		const { result: tempFile, warnings } = await withCapturedWarnings(() =>
+			processVideo(dualAudioPath, metadataWithoutPreferredStream, {
+				remuxOnly: true,
+			}),
+		);
+		tempFiles.push(tempFile.path);
+
+		const outputMetadata = await probeVideo(`file://${tempFile.path}`);
+		expect(outputMetadata.audioCodec).toBeNull();
+		expect(outputMetadata.audioStreamCount).toBe(0);
+		expect(
+			warnings.some((warning) =>
+				warning.includes(
+					"no valid preferred audio stream index was available",
+				),
+			),
+		).toBe(true);
+		expect(
+			warnings.some((warning) =>
+				warning.includes("stripping audio instead of guessing"),
+			),
+		).toBe(true);
+
+		await tempFile.cleanup();
+	}, 60000);
+
+	test("remuxOnly strips audio when multiple tracks exist but audio codec metadata is missing", async () => {
+		const dualAudioPath = createDualAudioFixture();
+		const metadata = await probeVideo(`file://${dualAudioPath}`);
+		const metadataWithoutAudioCodec = {
+			...metadata,
+			audioCodec: null,
+		};
+
+		const { result: tempFile, warnings } = await withCapturedWarnings(() =>
+			processVideo(dualAudioPath, metadataWithoutAudioCodec, {
+				remuxOnly: true,
+			}),
+		);
+		tempFiles.push(tempFile.path);
+
+		const outputMetadata = await probeVideo(`file://${tempFile.path}`);
+		expect(outputMetadata.audioCodec).toBeNull();
+		expect(outputMetadata.audioStreamCount).toBe(0);
+		expect(
+			warnings.some((warning) =>
+				warning.includes("no audio codec metadata was available"),
+			),
+		).toBe(true);
+		expect(
+			warnings.some((warning) =>
+				warning.includes("stripping audio instead of guessing"),
+			),
+		).toBe(true);
 
 		await tempFile.cleanup();
 	}, 60000);
