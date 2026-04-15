@@ -3,6 +3,7 @@ import {
 	getMultipartFileKey,
 	getSubpath,
 	isRawRecorderUpload,
+	shouldRemuxUploadedResult,
 } from "@/app/api/upload/[...route]/multipart-utils";
 
 describe("multipart upload utils", () => {
@@ -43,6 +44,14 @@ describe("multipart upload utils", () => {
 		expect(isRawRecorderUpload("raw-upload.webm")).toBe(true);
 		expect(isRawRecorderUpload("raw-upload.mp4")).toBe(true);
 		expect(isRawRecorderUpload("result.mp4")).toBe(false);
+	});
+
+	it("only remuxes finalized result uploads", () => {
+		expect(shouldRemuxUploadedResult("result.mp4")).toBe(true);
+		expect(shouldRemuxUploadedResult("raw-upload.mp4")).toBe(false);
+		expect(shouldRemuxUploadedResult("screenshot/screen-capture.jpg")).toBe(
+			false,
+		);
 	});
 
 	it("rejects missing video ids", () => {

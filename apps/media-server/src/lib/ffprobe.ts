@@ -83,16 +83,20 @@ interface FFprobeOutput {
 		size?: string;
 		bit_rate?: string;
 	};
-	streams?: Array<{
-		codec_type?: "video" | "audio";
-		codec_name?: string;
-		width?: number;
-		height?: number;
-		r_frame_rate?: string;
-		avg_frame_rate?: string;
-		channels?: number;
-		sample_rate?: string;
-	}>;
+	streams?: FFprobeStream[];
+}
+
+export interface FFprobeStream {
+	index?: number;
+	codec_type?: "video" | "audio";
+	codec_name?: string;
+	width?: number;
+	height?: number;
+	r_frame_rate?: string;
+	avg_frame_rate?: string;
+	channels?: number;
+	sample_rate?: string;
+	bit_rate?: string;
 }
 
 function parseFrameRate(rateStr: string | undefined): number {
@@ -104,6 +108,87 @@ function parseFrameRate(rateStr: string | undefined): number {
 		if (den !== 0) return num / den;
 	}
 	return Number.parseFloat(rateStr) || 0;
+}
+
+function getAudioStreams(streams: FFprobeStream[] | undefined): FFprobeStream[] {
+	return (streams ?? []).filter((stream) => stream.codec_type === "audio");
+}
+
+function parseBitRate(bitRate: string | undefined): number | null {
+	if (!bitRate) return null;
+	const parsed = Number.parseInt(bitRate, 10);
+	return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+}
+
+export function selectPreferredAudioStreamIndex(
+	streams: FFprobeStream[] | undefined,
+): number | null {
+	const audioStreams = getAudioStreams(streams);
+	if (audioStreams.length <= 1) {
+		return null;
+	}
+
+	let preferredAudioStreamIndex: number | null = null;
+	let highestBitRate = -1;
+
+	for (const [audioStreamIndex, stream] of audioStreams.entries()) {
+		const streamBitRate = parseBitRate(stream.bit_rate);
+		if (streamBitRate === null) {
+			continue;
+		}
+
+		if (streamBitRate > highestBitRate) {
+			highestBitRate = streamBitRate;
+			preferredAudioStreamIndex = audioStreamIndex;
+		}
+	}
+
+	return preferredAudioStreamIndex;
+}
+
+function extractVideoMetadata(
+	data: FFprobeOutput,
+	rawOutput: string,
+	context: string,
+): VideoMetadata {
+	const videoStream = data.streams?.find((s) => s.codec_type === "video");
+	const audioStreams = getAudioStreams(data.streams);
+	const preferredAudioStreamIndex = selectPreferredAudioStreamIndex(data.streams);
+	const selectedAudioStream =
+		preferredAudioStreamIndex !== null
+			? audioStreams[preferredAudioStreamIndex]
+			: audioStreams[0];
+
+	if (!videoStream) {
+		console.error(
+			`${context} No video stream found in file. Raw output: ${rawOutput.substring(0, 500)}`,
+		);
+		throw new Error("No video stream found");
+	}
+
+	const duration = Number.parseFloat(data.format?.duration ?? "0");
+	const fileSize = Number.parseInt(data.format?.size ?? "0", 10);
+	const bitrate = Number.parseInt(data.format?.bit_rate ?? "0", 10);
+	const fps =
+		parseFrameRate(videoStream.r_frame_rate) ||
+		parseFrameRate(videoStream.avg_frame_rate);
+
+	return {
+		duration,
+		width: videoStream.width ?? 0,
+		height: videoStream.height ?? 0,
+		fps: Math.round(fps * 100) / 100,
+		videoCodec: videoStream.codec_name ?? "unknown",
+		audioCodec: selectedAudioStream?.codec_name ?? null,
+		audioChannels: selectedAudioStream?.channels ?? null,
+		sampleRate: selectedAudioStream?.sample_rate
+			? Number.parseInt(selectedAudioStream.sample_rate, 10)
+			: null,
+		audioStreamCount: audioStreams.length,
+		preferredAudioStreamIndex,
+		bitrate,
+		fileSize,
+	};
 }
 
 export async function probeVideo(videoUrl: string): Promise<VideoMetadata> {
@@ -152,42 +237,16 @@ export async function probeVideo(videoUrl: string): Promise<VideoMetadata> {
 				if (data.streams) {
 					for (const stream of data.streams) {
 						console.log(
-							`[probeVideo] Stream: codec_type=${stream.codec_type}, codec_name=${stream.codec_name}, width=${stream.width}, height=${stream.height}`,
+							`[probeVideo] Stream: codec_type=${stream.codec_type}, codec_name=${stream.codec_name}, width=${stream.width}, height=${stream.height}, bit_rate=${stream.bit_rate}`,
 						);
 					}
 				}
 
-				const videoStream = data.streams?.find((s) => s.codec_type === "video");
-				const audioStream = data.streams?.find((s) => s.codec_type === "audio");
-
-				if (!videoStream) {
-					console.error(
-						`[probeVideo] No video stream found in file. Raw output: ${stdoutText.substring(0, 500)}`,
-					);
-					throw new Error("No video stream found");
-				}
-
-				const duration = Number.parseFloat(data.format?.duration ?? "0");
-				const fileSize = Number.parseInt(data.format?.size ?? "0", 10);
-				const bitrate = Number.parseInt(data.format?.bit_rate ?? "0", 10);
-				const fps =
-					parseFrameRate(videoStream.r_frame_rate) ||
-					parseFrameRate(videoStream.avg_frame_rate);
-
-				return {
-					duration,
-					width: videoStream.width ?? 0,
-					height: videoStream.height ?? 0,
-					fps: Math.round(fps * 100) / 100,
-					videoCodec: videoStream.codec_name ?? "unknown",
-					audioCodec: audioStream?.codec_name ?? null,
-					audioChannels: audioStream?.channels ?? null,
-					sampleRate: audioStream?.sample_rate
-						? Number.parseInt(audioStream.sample_rate, 10)
-						: null,
-					bitrate,
-					fileSize,
-				};
+				return extractVideoMetadata(
+					data,
+					stdoutText,
+					"[probeVideo]",
+				);
 			})(),
 			PROBE_TIMEOUT_MS,
 			() => terminateProcess(proc),
@@ -248,34 +307,11 @@ export async function probeVideoFile(filePath: string): Promise<VideoMetadata> {
 					`[probeVideoFile] ffprobe output for ${filePath}: format=${JSON.stringify(data.format)}, streams=${data.streams?.length ?? 0}`,
 				);
 
-				const videoStream = data.streams?.find((s) => s.codec_type === "video");
-				const audioStream = data.streams?.find((s) => s.codec_type === "audio");
-
-				if (!videoStream) {
-					throw new Error("No video stream found");
-				}
-
-				const duration = Number.parseFloat(data.format?.duration ?? "0");
-				const fileSize = Number.parseInt(data.format?.size ?? "0", 10);
-				const bitrate = Number.parseInt(data.format?.bit_rate ?? "0", 10);
-				const fps =
-					parseFrameRate(videoStream.r_frame_rate) ||
-					parseFrameRate(videoStream.avg_frame_rate);
-
-				return {
-					duration,
-					width: videoStream.width ?? 0,
-					height: videoStream.height ?? 0,
-					fps: Math.round(fps * 100) / 100,
-					videoCodec: videoStream.codec_name ?? "unknown",
-					audioCodec: audioStream?.codec_name ?? null,
-					audioChannels: audioStream?.channels ?? null,
-					sampleRate: audioStream?.sample_rate
-						? Number.parseInt(audioStream.sample_rate, 10)
-						: null,
-					bitrate,
-					fileSize,
-				};
+				return extractVideoMetadata(
+					data,
+					stdoutText,
+					"[probeVideoFile]",
+				);
 			})(),
 			PROBE_TIMEOUT_MS,
 			() => terminateProcess(proc),

@@ -437,6 +437,75 @@ function needsAudioTranscode(metadata: VideoMetadata): boolean {
 	return metadata.audioCodec !== "aac";
 }
 
+interface AudioSelectionPlan {
+	args: string[];
+	stripAudio: boolean;
+}
+
+function buildStripAudioSelectionPlan(warning: string): AudioSelectionPlan {
+	console.warn(warning);
+	return {
+		args: ["-map", "0:v:0", "-an"],
+		stripAudio: true,
+	};
+}
+
+function getPreferredAudioMapArgs(metadata: VideoMetadata): AudioSelectionPlan {
+	const audioStreamCount = metadata.audioStreamCount ?? 0;
+
+	try {
+		if (audioStreamCount <= 1) {
+			return {
+				args: [],
+				stripAudio: false,
+			};
+		}
+
+		if (!metadata.audioCodec) {
+			return buildStripAudioSelectionPlan(
+				`[processVideo] Multiple audio streams detected (${audioStreamCount}) but no audio codec metadata was available; stripping audio instead of guessing which track to keep.`,
+			);
+		}
+
+		if (
+			metadata.preferredAudioStreamIndex === null ||
+			metadata.preferredAudioStreamIndex === undefined ||
+			metadata.preferredAudioStreamIndex < 0 ||
+			metadata.preferredAudioStreamIndex >= audioStreamCount
+		) {
+			return buildStripAudioSelectionPlan(
+				`[processVideo] Multiple audio streams detected (${audioStreamCount}) but no valid preferred audio stream index was available (${metadata.preferredAudioStreamIndex}); stripping audio instead of guessing which track to keep.`,
+			);
+		}
+
+		return {
+			args: [
+				"-map",
+				"0:v:0",
+				"-map",
+				`0:a:${metadata.preferredAudioStreamIndex}`,
+			],
+			stripAudio: false,
+		};
+	} catch (error) {
+		console.warn(
+			audioStreamCount > 1
+				? "[processVideo] Failed to select a preferred audio stream from multiple tracks; stripping audio instead of guessing which track to keep."
+				: "[processVideo] Failed to select preferred audio stream.",
+			error,
+		);
+		return audioStreamCount > 1
+			? {
+					args: ["-map", "0:v:0", "-an"],
+					stripAudio: true,
+				}
+			: {
+					args: [],
+					stripAudio: false,
+				};
+	}
+}
+
 export async function downloadVideoToTemp(
 	videoUrl: string,
 	inputExtension?: string,
@@ -754,6 +823,7 @@ export async function processVideo(
 		metadata.duration,
 		opts.timeoutMs,
 	);
+	const preferredAudioSelection = getPreferredAudioMapArgs(metadata);
 
 	const ffmpegArgs: string[] = [
 		"ffmpeg",
@@ -762,6 +832,7 @@ export async function processVideo(
 		...extraInputArgs,
 		"-i",
 		inputPath,
+		...preferredAudioSelection.args,
 	];
 
 	if (videoTranscode) {
@@ -779,7 +850,9 @@ export async function processVideo(
 		ffmpegArgs.push("-c:v", "copy");
 	}
 
-	if (metadata.audioCodec) {
+	if (preferredAudioSelection.stripAudio) {
+		// Audio is already explicitly disabled in the input mapping args.
+	} else if (metadata.audioCodec) {
 		if (audioTranscode) {
 			ffmpegArgs.push("-c:a", "aac", "-b:a", opts.audioBitrate);
 		} else {
