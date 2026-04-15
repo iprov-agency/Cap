@@ -37,6 +37,49 @@ const runPromiseAnyEnv = runPromise as <A, E>(
 	effect: Effect.Effect<A, E, unknown>,
 ) => Promise<A>;
 
+function isS3MissingObjectError(error: unknown): boolean {
+	if (!error || typeof error !== "object" || !("cause" in error)) {
+		return false;
+	}
+
+	const underlying = (error as { cause: unknown }).cause;
+	if (!underlying || typeof underlying !== "object") {
+		return false;
+	}
+
+	if ("name" in underlying) {
+		const name = (underlying as { name?: unknown }).name;
+		if (name === "NotFound" || name === "NoSuchKey") {
+			return true;
+		}
+	}
+
+	if ("$metadata" in underlying) {
+		const statusCode = (
+			underlying as {
+				$metadata?: { httpStatusCode?: unknown };
+			}
+		).$metadata?.httpStatusCode;
+		return statusCode === 404;
+	}
+
+	return false;
+}
+
+function createMediaServerJsonHeaders(
+	mediaServerSecret: string | undefined,
+): Record<string, string> {
+	const headers: Record<string, string> = {
+		"Content-Type": "application/json",
+	};
+
+	if (mediaServerSecret) {
+		headers["x-media-server-secret"] = mediaServerSecret;
+	}
+
+	return headers;
+}
+
 async function triggerMultipartThumbnailFallback(params: {
 	bucketId: Option.Option<S3Bucket.S3BucketId>;
 	fileKey: string;
@@ -44,6 +87,7 @@ async function triggerMultipartThumbnailFallback(params: {
 	videoId: Video.VideoId;
 }) {
 	const mediaServerUrl = serverEnv().MEDIA_SERVER_URL;
+	const mediaServerSecret = serverEnv().MEDIA_SERVER_WEBHOOK_SECRET || undefined;
 	if (!mediaServerUrl) {
 		console.warn(
 			`[multipart] MEDIA_SERVER_URL is not configured; skipping thumbnail fallback for ${params.videoId}`,
@@ -57,7 +101,11 @@ async function triggerMultipartThumbnailFallback(params: {
 
 		const screenshotExists = yield* bucket.headObject(screenshotKey).pipe(
 			Effect.as(true),
-			Effect.catchAll(() => Effect.succeed(false)),
+			Effect.catchAll((error) =>
+				isS3MissingObjectError(error)
+					? Effect.succeed(false)
+					: Effect.fail(error),
+			),
 		);
 
 		if (screenshotExists) {
@@ -65,17 +113,6 @@ async function triggerMultipartThumbnailFallback(params: {
 		}
 
 		const videoUrl = yield* bucket.getInternalSignedObjectUrl(params.fileKey);
-		const outputPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
-			params.fileKey,
-			{
-				ContentType: "video/mp4",
-				CacheControl: "max-age=31536000",
-				Metadata: {
-					userId: params.userId,
-					source: "cap-thumbnail-fallback",
-				},
-			},
-		);
 		const thumbnailPresignedUrl = yield* bucket.getInternalPresignedPutUrl(
 			screenshotKey,
 			{
@@ -84,7 +121,6 @@ async function triggerMultipartThumbnailFallback(params: {
 		);
 
 		return {
-			outputPresignedUrl,
 			thumbnailPresignedUrl,
 			videoUrl,
 		};
@@ -94,16 +130,12 @@ async function triggerMultipartThumbnailFallback(params: {
 		return;
 	}
 
-	const response = await fetch(`${mediaServerUrl}/video/process`, {
+	// Use the dedicated thumbnail endpoint so the fallback never rewrites result.mp4.
+	const response = await fetch(`${mediaServerUrl}/video/thumbnail`, {
 		method: "POST",
-		headers: { "Content-Type": "application/json" },
+		headers: createMediaServerJsonHeaders(mediaServerSecret),
 		body: JSON.stringify({
-			videoId: params.videoId,
-			userId: params.userId,
 			videoUrl: fallbackPayload.videoUrl,
-			outputPresignedUrl: fallbackPayload.outputPresignedUrl,
-			thumbnailPresignedUrl: fallbackPayload.thumbnailPresignedUrl,
-			remuxOnly: true,
 		}),
 	});
 
@@ -111,6 +143,27 @@ async function triggerMultipartThumbnailFallback(params: {
 		const errorText = await response.text().catch(() => "");
 		throw new Error(
 			`Media server thumbnail fallback failed: ${response.status} ${errorText}`,
+		);
+	}
+
+	const thumbnailBuffer = await response.arrayBuffer();
+	if (thumbnailBuffer.byteLength === 0) {
+		throw new Error("Media server thumbnail fallback returned an empty image");
+	}
+
+	const uploadResponse = await fetch(fallbackPayload.thumbnailPresignedUrl, {
+		method: "PUT",
+		headers: {
+			"Content-Type": "image/jpeg",
+			"Content-Length": thumbnailBuffer.byteLength.toString(),
+		},
+		body: new Uint8Array(thumbnailBuffer),
+	});
+
+	if (!uploadResponse.ok) {
+		const errorText = await uploadResponse.text().catch(() => "");
+		throw new Error(
+			`Thumbnail fallback upload failed: ${uploadResponse.status} ${errorText}`,
 		);
 	}
 }
@@ -591,7 +644,9 @@ app.post(
 									`${mediaServerUrl}/video/process`,
 									{
 										method: "POST",
-										headers: { "Content-Type": "application/json" },
+										headers: createMediaServerJsonHeaders(
+											serverEnv().MEDIA_SERVER_WEBHOOK_SECRET || undefined,
+										),
 										body: JSON.stringify({
 											videoId,
 											userId: user.id,
