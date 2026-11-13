@@ -1,0 +1,99 @@
+# iProv: builds our patched cap-web image (upstream + the R2 presigned-PUT patch).
+# Pushes ghcr.io/iprov-agency/cap-web:upstream-r2-<shortsha> only. It must never
+# push `latest`: production pulls cap-web:latest until the cutover.
+name: "iProv cap-web (upstream-r2)"
+
+on:
+  push:
+    branches:
+      - iprov/upstream-r2
+  workflow_dispatch:
+
+concurrency:
+  group: iprov-cap-web-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Typecheck and patch tests
+    if: github.repository_owner == 'iprov-agency'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-js
+
+      - run: bun run --cwd apps/web next typegen
+
+      - name: Patch tests
+        run: >-
+          bun run --cwd apps/web test
+          __tests__/unit/s3-presigned-post-switch.test.ts
+          __tests__/unit/signed-upload-metadata.test.ts
+          __tests__/unit/desktop-recording-output-replacement.test.ts
+
+      - name: Typecheck
+        run: bun run typecheck
+
+      # Informational: the whole web unit suite. Upstream failures here don't
+      # block our image; read the log.
+      - name: Web unit suite (informational)
+        continue-on-error: true
+        run: bun run --cwd apps/web test __tests__/unit
+
+  build:
+    name: Build cap-web (linux/amd64)
+    needs: test
+    if: github.repository_owner == 'iprov-agency'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Compute tag
+        run: |
+          tag="upstream-r2-${GITHUB_SHA::9}"
+          if [ "$tag" = "latest" ] || [ -z "${GITHUB_SHA}" ]; then
+            echo "Refusing to push tag '$tag'" >&2
+            exit 1
+          fi
+          echo "IMAGE=ghcr.io/iprov-agency/cap-web:${tag}" >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create .env file
+        run: |
+          echo "WEB_URL=http://localhost:3000" > .env
+          echo "NEXT_PUBLIC_DOCKER_BUILD=true" >> .env
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}
+          cache-from: type=gha,scope=iprov-upstream-r2-amd64
+          cache-to: type=gha,mode=max,scope=iprov-upstream-r2-amd64
+
+      - name: Summary
+        run: |
+          echo "Image: ${IMAGE}" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Digest: ${{ steps.build.outputs.digest }}" | tee -a "$GITHUB_STEP_SUMMARY"
