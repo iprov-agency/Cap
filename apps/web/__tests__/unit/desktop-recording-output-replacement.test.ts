@@ -225,6 +225,7 @@ beforeEach(() => {
 	});
 	mocks.post.mockReturnValue(
 		Effect.succeed({
+			type: "s3Post",
 			url: "https://storage.test/upload",
 			fields: { key: "user/video/result.mp4" },
 		}),
@@ -234,7 +235,7 @@ beforeEach(() => {
 			Effect.succeed([
 				{
 					headObject: mocks.head,
-					getPresignedPostUrl: mocks.post,
+					createUploadTarget: mocks.post,
 					getInternalSignedObjectUrl: (key: string) =>
 						Effect.succeed(
 							`https://storage.test/${options?.resolvePublishedOutput === false ? "canonical" : "published"}/${key}`,
@@ -703,10 +704,9 @@ describe("intentional administrator replacements", () => {
 		expect(mocks.access).toHaveBeenCalledWith(video, {
 			resolvePublishedOutput: false,
 		});
-		expect(mocks.post).toHaveBeenCalledWith(
-			"user/video/result.mp4",
-			expect.any(Object),
-		);
+		expect(mocks.post).toHaveBeenCalledWith("user/video/result.mp4", {
+			contentType: "video/mp4",
+		});
 		expect(mocks.retire).not.toHaveBeenCalled();
 	});
 });

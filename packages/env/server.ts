@@ -62,6 +62,9 @@ function createServerEnv() {
 			S3_PATH_STYLE: boolString(true).describe(
 				"Whether the bucket should be accessed using path-style URLs (common for non-AWS providers, eg. '/{bucket}/{key}') or virtual-hosted-style URLs (eg. '{bucket}.s3.amazonaws.com/{key}').",
 			),
+			CAP_STORAGE_DISABLE_PRESIGNED_POST: boolString(false).describe(
+				"Hand out presigned PUT URLs instead of presigned POST forms for every S3 single-file upload. Enable this for providers that don't support presigned POST, such as Cloudflare R2.",
+			),
 
 			/// CloudFront configuration
 			// Configure these if you'd like to serve assets from the default bucket via CloudFront

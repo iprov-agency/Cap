@@ -100,6 +100,22 @@ describe("signed upload metadata", () => {
 		expect(mocks.updateWhere).not.toHaveBeenCalled();
 	});
 
+	it("answers a request without a method with PUT data when storage returns a PUT target", async () => {
+		const response = await app.request("https://cap.test/", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ videoId: "video-1", subpath: "result.mp4" }),
+		});
+
+		expect(response.status).toBe(200);
+		const body = await response.json();
+		expect(body).not.toHaveProperty("presignedPostData");
+		expect(body.presignedPutData).toMatchObject({
+			url: "https://upload.test/object",
+			type: "put",
+		});
+	});
+
 	it.each([
 		["durationInSecs", 0],
 		["width", 0],

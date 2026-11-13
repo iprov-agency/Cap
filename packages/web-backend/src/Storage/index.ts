@@ -518,7 +518,11 @@ const makeS3Access = (s3: S3BucketAccess) => ({
 	multipart: makeS3MultipartAccess(s3),
 	createUploadTarget: (key: string, input: UploadTargetInput) =>
 		Effect.gen(function* () {
-			if (input.method === "put") {
+			// Some S3-compatible providers (eg. Cloudflare R2) reject presigned POST.
+			if (
+				input.method === "put" ||
+				serverEnv().CAP_STORAGE_DISABLE_PRESIGNED_POST
+			) {
 				const url = yield* s3
 					.getPresignedPutUrl(
 						key,
